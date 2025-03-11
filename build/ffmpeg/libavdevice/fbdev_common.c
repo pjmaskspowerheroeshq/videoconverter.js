@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include "fbdev_common.h"
 #include "libavutil/common.h"
+#include "libavutil/file_open.h"
+#include "libavutil/mem.h"
 #include "avdevice.h"
 
 struct rgb_pixfmt_map_entry {
@@ -42,7 +44,7 @@ static const struct rgb_pixfmt_map_entry rgb_pixfmt_map[] = {
     {  32,       3,           2,           8,            0,   AV_PIX_FMT_ABGR  },
     {  24,       0,           8,          16,            0,   AV_PIX_FMT_RGB24 },
     {  24,      16,           8,           0,            0,   AV_PIX_FMT_BGR24 },
-    {  16,      11,           5,           0,           16,   AV_PIX_FMT_RGB565 },
+    {  16,      11,           5,           0,            0,   AV_PIX_FMT_RGB565 },
 };
 
 enum AVPixelFormat ff_get_pixfmt_from_fb_varinfo(struct fb_var_screeninfo *varinfo)
@@ -61,7 +63,7 @@ enum AVPixelFormat ff_get_pixfmt_from_fb_varinfo(struct fb_var_screeninfo *varin
     return AV_PIX_FMT_NONE;
 }
 
-const char* ff_fbdev_default_device()
+const char *ff_fbdev_default_device(void)
 {
     const char *dev = getenv("FRAMEBUFFER");
     if (!dev)
@@ -84,8 +86,13 @@ int ff_fbdev_get_device_list(AVDeviceInfoList *device_list)
     for (i = 0; i <= 31; i++) {
         snprintf(device_file, sizeof(device_file), "/dev/fb%d", i);
 
-        if ((fd = avpriv_open(device_file, O_RDWR)) < 0)
+        if ((fd = avpriv_open(device_file, O_RDWR)) < 0) {
+            int err = AVERROR(errno);
+            if (err != AVERROR(ENOENT))
+                av_log(NULL, AV_LOG_ERROR, "Could not open framebuffer device '%s': %s\n",
+                       device_file, av_err2str(err));
             continue;
+        }
         if (ioctl(fd, FBIOGET_VSCREENINFO, &varinfo) == -1)
             goto fail_device;
         if (ioctl(fd, FBIOGET_FSCREENINFO, &fixinfo) == -1)
@@ -116,8 +123,8 @@ int ff_fbdev_get_device_list(AVDeviceInfoList *device_list)
 
       fail_device:
         if (device) {
-            av_free(device->device_name);
-            av_free(device->device_description);
+            av_freep(&device->device_name);
+            av_freep(&device->device_description);
             av_freep(&device);
         }
         if (fd >= 0)

@@ -1,6 +1,4 @@
 /*
- * Copyright (c) 2003-2010 Michael Niedermayer <michaelni@gmx.at>
- *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -22,13 +20,16 @@
  * @file
  * Accelerated start code search function for start codes common to
  * MPEG-1/2/4 video, VC-1, H.264/5
- * @author Michael Niedermayer <michaelni@gmx.at>
  */
 
 #ifndef AVCODEC_STARTCODE_H
 #define AVCODEC_STARTCODE_H
 
 #include <stdint.h>
+
+const uint8_t *avpriv_find_start_code(const uint8_t *p,
+                                      const uint8_t *end,
+                                      uint32_t *state);
 
 int ff_startcode_find_candidate_c(const uint8_t *buf, int size);
 

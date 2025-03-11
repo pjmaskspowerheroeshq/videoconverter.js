@@ -21,29 +21,30 @@
  */
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "encode.h"
+#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 
 static av_cold int avui_encode_init(AVCodecContext *avctx)
 {
-    avctx->coded_frame = av_frame_alloc();
-
     if (avctx->width != 720 || avctx->height != 486 && avctx->height != 576) {
         av_log(avctx, AV_LOG_ERROR, "Only 720x486 and 720x576 are supported.\n");
         return AVERROR(EINVAL);
     }
-    if (!avctx->coded_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame.\n");
+    if (!(avctx->extradata = av_mallocz(144 + AV_INPUT_BUFFER_PADDING_SIZE)))
         return AVERROR(ENOMEM);
-    }
-    if (!(avctx->extradata = av_mallocz(24 + FF_INPUT_BUFFER_PADDING_SIZE)))
-        return AVERROR(ENOMEM);
-    avctx->extradata_size = 24;
+    avctx->extradata_size = 144;
     memcpy(avctx->extradata, "\0\0\0\x18""APRGAPRG0001", 16);
     if (avctx->field_order > AV_FIELD_PROGRESSIVE) {
         avctx->extradata[19] = 2;
     } else {
         avctx->extradata[19] = 1;
     }
+    memcpy(avctx->extradata + 24, "\0\0\0\x78""ARESARES0001""\0\0\0\x98", 20);
+    AV_WB32(avctx->extradata + 44, avctx->width);
+    AV_WB32(avctx->extradata + 48, avctx->height);
+    memcpy(avctx->extradata + 52, "\0\0\0\x1\0\0\0\x20\0\0\0\x2", 12);
 
 
     return 0;
@@ -52,7 +53,7 @@ static av_cold int avui_encode_init(AVCodecContext *avctx)
 static int avui_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                              const AVFrame *pic, int *got_packet)
 {
-    uint8_t *dst, *src = pic->data[0];
+    uint8_t *dst;
     int i, j, skip, ret, size, interlaced;
 
     interlaced = avctx->field_order > AV_FIELD_PROGRESSIVE;
@@ -63,22 +64,22 @@ static int avui_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         skip = 16;
     }
     size = 2 * avctx->width * (avctx->height + skip) + 8 * interlaced;
-    if ((ret = ff_alloc_packet2(avctx, pkt, size)) < 0)
+    if ((ret = ff_get_encode_buffer(avctx, pkt, size, 0)) < 0)
         return ret;
     dst = pkt->data;
     if (!interlaced) {
+        memset(dst, 0, avctx->width * skip);
         dst += avctx->width * skip;
     }
 
-    avctx->coded_frame->key_frame = 1;
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-
     for (i = 0; i <= interlaced; i++) {
+        const uint8_t *src;
         if (interlaced && avctx->height == 486) {
             src = pic->data[0] + (1 - i) * pic->linesize[0];
         } else {
             src = pic->data[0] + i * pic->linesize[0];
         }
+        memset(dst, 0, avctx->width * skip + 4 * i);
         dst += avctx->width * skip + 4 * i;
         for (j = 0; j < avctx->height; j += interlaced + 1) {
             memcpy(dst, src, avctx->width * 2);
@@ -87,26 +88,19 @@ static int avui_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         }
     }
 
-    pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
     return 0;
 }
 
-static av_cold int avui_encode_close(AVCodecContext *avctx)
-{
-    av_freep(&avctx->coded_frame);
-
-    return 0;
-}
-
-AVCodec ff_avui_encoder = {
-    .name         = "avui",
-    .long_name    = NULL_IF_CONFIG_SMALL("Avid Meridien Uncompressed"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_AVUI,
+const FFCodec ff_avui_encoder = {
+    .p.name         = "avui",
+    CODEC_LONG_NAME("Avid Meridien Uncompressed"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_AVUI,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_EXPERIMENTAL |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    .p.pix_fmts     = (const enum AVPixelFormat[]){ AV_PIX_FMT_UYVY422, AV_PIX_FMT_NONE },
+    .color_ranges   = AVCOL_RANGE_MPEG,
     .init         = avui_encode_init,
-    .encode2      = avui_encode_frame,
-    .close        = avui_encode_close,
-    .capabilities = CODEC_CAP_EXPERIMENTAL,
-    .pix_fmts     = (const enum AVPixelFormat[]){ AV_PIX_FMT_UYVY422, AV_PIX_FMT_NONE },
+    FF_CODEC_ENCODE_CB(avui_encode_frame),
 };

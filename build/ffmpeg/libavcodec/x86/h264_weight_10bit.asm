@@ -26,11 +26,12 @@
 
 SECTION_RODATA 32
 
-pw_pixel_max: times 8 dw ((1 << 10)-1)
 sq_1: dq 1
       dq 0
 
 cextern pw_1
+cextern pw_1023
+%define pw_pixel_max pw_1023
 
 SECTION .text
 
@@ -100,7 +101,7 @@ cglobal h264_weight_16_10
     add       r0, r1
     dec       r2d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2
@@ -119,7 +120,7 @@ cglobal h264_weight_8_10
     add        r0, r1
     dec        r2d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2
@@ -141,7 +142,7 @@ cglobal h264_weight_4_10
     add         r0, r3
     dec         r2d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2
@@ -233,7 +234,7 @@ cglobal h264_biweight_16_10
     add       r1, r2
     dec       r3d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2
@@ -252,7 +253,7 @@ cglobal h264_biweight_8_10
     add      r1, r2
     dec      r3d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2
@@ -274,7 +275,7 @@ cglobal h264_biweight_4_10
     add         r1, r4
     dec         r3d
     jnz .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2

@@ -20,11 +20,11 @@
  */
 
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 
-
-typedef struct {
+typedef struct AvsContext {
     AVFrame *frame;
 } AvsContext;
 
@@ -43,15 +43,13 @@ typedef enum {
 } AvsVideoSubType;
 
 
-static int
-avs_decode_frame(AVCodecContext * avctx,
-                 void *data, int *got_frame, AVPacket *avpkt)
+static int avs_decode_frame(AVCodecContext * avctx, AVFrame *picture,
+                            int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     const uint8_t *buf_end = avpkt->data + avpkt->size;
     int buf_size = avpkt->size;
     AvsContext *const avs = avctx->priv_data;
-    AVFrame *picture = data;
     AVFrame *const p =  avs->frame;
     const uint8_t *table, *vect;
     uint8_t *out;
@@ -60,10 +58,10 @@ avs_decode_frame(AVCodecContext * avctx,
     AvsBlockType type;
     GetBitContext change_map = {0}; //init to silence warning
 
-    if ((ret = ff_reget_buffer(avctx, p)) < 0)
+    if ((ret = ff_reget_buffer(avctx, p, 0)) < 0)
         return ret;
     p->pict_type = AV_PICTURE_TYPE_P;
-    p->key_frame = 0;
+    p->flags &= ~AV_FRAME_FLAG_KEY;
 
     out    = p->data[0];
     stride = p->linesize[0];
@@ -99,7 +97,7 @@ avs_decode_frame(AVCodecContext * avctx,
     switch (sub_type) {
     case AVS_I_FRAME:
         p->pict_type = AV_PICTURE_TYPE_I;
-        p->key_frame = 1;
+        p->flags |= AV_FRAME_FLAG_KEY;
     case AVS_P_FRAME_3X3:
         vect_w = 3;
         vect_h = 3;
@@ -165,9 +163,8 @@ static av_cold int avs_decode_init(AVCodecContext * avctx)
         return AVERROR(ENOMEM);
 
     avctx->pix_fmt = AV_PIX_FMT_PAL8;
-    ff_set_dimensions(avctx, 318, 198);
 
-    return 0;
+    return ff_set_dimensions(avctx, 318, 198);
 }
 
 static av_cold int avs_decode_end(AVCodecContext *avctx)
@@ -178,14 +175,14 @@ static av_cold int avs_decode_end(AVCodecContext *avctx)
 }
 
 
-AVCodec ff_avs_decoder = {
-    .name           = "avs",
-    .long_name      = NULL_IF_CONFIG_SMALL("AVS (Audio Video Standard) video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_AVS,
+const FFCodec ff_avs_decoder = {
+    .p.name         = "avs",
+    CODEC_LONG_NAME("AVS (Audio Video Standard) video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_AVS,
     .priv_data_size = sizeof(AvsContext),
     .init           = avs_decode_init,
-    .decode         = avs_decode_frame,
+    FF_CODEC_DECODE_CB(avs_decode_frame),
     .close          = avs_decode_end,
-    .capabilities   = CODEC_CAP_DR1,
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

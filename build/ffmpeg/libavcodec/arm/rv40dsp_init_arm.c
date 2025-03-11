@@ -26,8 +26,10 @@
 #include "libavutil/arm/cpu.h"
 
 #define DECL_QPEL3(type, w, pos) \
-    void ff_##type##_rv40_qpel##w##_mc##pos##_neon(uint8_t *dst, uint8_t *src,\
-                                                   ptrdiff_t stride)
+void ff_ ## type ## _rv40_qpel ## w ## _mc ## pos ## _neon(uint8_t *dst,       \
+                                                           const uint8_t *src, \
+                                                           ptrdiff_t stride)
+
 #define DECL_QPEL2(w, pos)                      \
     DECL_QPEL3(put, w, pos);                    \
     DECL_QPEL3(avg, w, pos)
@@ -47,11 +49,11 @@ DECL_QPEL_Y(1);
 DECL_QPEL_Y(2);
 DECL_QPEL_Y(3);
 
-void ff_put_rv40_chroma_mc8_neon(uint8_t *, uint8_t *, int, int, int, int);
-void ff_put_rv40_chroma_mc4_neon(uint8_t *, uint8_t *, int, int, int, int);
+void ff_put_rv40_chroma_mc8_neon(uint8_t *, const uint8_t *, ptrdiff_t, int, int, int);
+void ff_put_rv40_chroma_mc4_neon(uint8_t *, const uint8_t *, ptrdiff_t, int, int, int);
 
-void ff_avg_rv40_chroma_mc8_neon(uint8_t *, uint8_t *, int, int, int, int);
-void ff_avg_rv40_chroma_mc4_neon(uint8_t *, uint8_t *, int, int, int, int);
+void ff_avg_rv40_chroma_mc8_neon(uint8_t *, const uint8_t *, ptrdiff_t, int, int, int);
+void ff_avg_rv40_chroma_mc4_neon(uint8_t *, const uint8_t *, ptrdiff_t, int, int, int);
 
 void ff_rv40_weight_func_16_neon(uint8_t *, uint8_t *, uint8_t *, int, int, ptrdiff_t);
 void ff_rv40_weight_func_8_neon(uint8_t *, uint8_t *, uint8_t *, int, int, ptrdiff_t);

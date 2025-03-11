@@ -17,7 +17,8 @@
  */
 
 #include "config.h"
-#include "internal.h"
+#include "avutil.h"
+#include "file_open.h"
 #include "mem.h"
 #include <stdarg.h>
 #include <fcntl.h>
@@ -29,7 +30,7 @@
 #include <io.h>
 #endif
 
-#if defined(_WIN32) && !defined(__MINGW32CE__)
+#ifdef _WIN32
 #undef open
 #undef lseek
 #undef stat
@@ -37,23 +38,18 @@
 #include <windows.h>
 #include <share.h>
 #include <errno.h>
+#include "wchar_filename.h"
 
 static int win32_open(const char *filename_utf8, int oflag, int pmode)
 {
     int fd;
-    int num_chars;
     wchar_t *filename_w;
 
     /* convert UTF-8 to wide chars */
-    num_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, filename_utf8, -1, NULL, 0);
-    if (num_chars <= 0)
-        goto fallback;
-    filename_w = av_mallocz_array(num_chars, sizeof(wchar_t));
-    if (!filename_w) {
-        errno = ENOMEM;
+    if (get_extended_win32_path(filename_utf8, &filename_w))
         return -1;
-    }
-    MultiByteToWideChar(CP_UTF8, 0, filename_utf8, -1, filename_w, num_chars);
+    if (!filename_w)
+        goto fallback;
 
     fd = _wsopen(filename_w, oflag, SH_DENYNO, pmode);
     av_freep(&filename_w);
@@ -82,6 +78,9 @@ int avpriv_open(const char *filename, int flags, ...)
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
+#ifdef O_NOINHERIT
+    flags |= O_NOINHERIT;
+#endif
 
     fd = open(filename, flags, mode);
 #if HAVE_FCNTL
@@ -94,7 +93,72 @@ int avpriv_open(const char *filename, int flags, ...)
     return fd;
 }
 
-FILE *av_fopen_utf8(const char *path, const char *mode)
+typedef struct FileLogContext {
+    const AVClass *class;
+    int   log_offset;
+    void *log_ctx;
+} FileLogContext;
+
+static const AVClass file_log_ctx_class = {
+    .class_name                = "TEMPFILE",
+    .item_name                 = av_default_item_name,
+    .option                    = NULL,
+    .version                   = LIBAVUTIL_VERSION_INT,
+    .log_level_offset_offset   = offsetof(FileLogContext, log_offset),
+    .parent_log_context_offset = offsetof(FileLogContext, log_ctx),
+};
+
+int avpriv_tempfile(const char *prefix, char **filename, int log_offset, void *log_ctx)
+{
+    FileLogContext file_log_ctx = { &file_log_ctx_class, log_offset, log_ctx };
+    int fd = -1;
+#if HAVE_MKSTEMP
+    size_t len = strlen(prefix) + 12; /* room for "/tmp/" and "XXXXXX\0" */
+    *filename  = av_malloc(len);
+#elif HAVE_TEMPNAM
+    void *ptr= tempnam(NULL, prefix);
+    if(!ptr)
+        ptr= tempnam(".", prefix);
+    *filename = av_strdup(ptr);
+#undef free
+    free(ptr);
+#else
+    return AVERROR(ENOSYS);
+#endif
+    /* -----common section-----*/
+    if (!*filename) {
+        av_log(&file_log_ctx, AV_LOG_ERROR, "ff_tempfile: Cannot allocate file name\n");
+        return AVERROR(ENOMEM);
+    }
+#if !HAVE_MKSTEMP
+#   ifndef O_BINARY
+#       define O_BINARY 0
+#   endif
+#   ifndef O_EXCL
+#       define O_EXCL 0
+#   endif
+    fd = open(*filename, O_RDWR | O_BINARY | O_CREAT | O_EXCL, 0600);
+#else
+    snprintf(*filename, len, "/tmp/%sXXXXXX", prefix);
+    fd = mkstemp(*filename);
+#if defined(_WIN32) || defined (__ANDROID__) || defined(__DJGPP__)
+    if (fd < 0) {
+        snprintf(*filename, len, "./%sXXXXXX", prefix);
+        fd = mkstemp(*filename);
+    }
+#endif
+#endif
+    /* -----common section-----*/
+    if (fd < 0) {
+        int err = AVERROR(errno);
+        av_log(&file_log_ctx, AV_LOG_ERROR, "ff_tempfile: Cannot open temporary file %s\n", *filename);
+        av_freep(filename);
+        return err;
+    }
+    return fd; /* success */
+}
+
+FILE *avpriv_fopen_utf8(const char *path, const char *mode)
 {
     int fd;
     int access;

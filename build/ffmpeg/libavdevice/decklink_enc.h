@@ -19,25 +19,22 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-struct decklink_cctx {
-    const AVClass *cclass;
-
-    void *ctx;
-
-    /* Options */
-    int list_devices;
-    int list_formats;
-    double preroll;
-};
+#ifndef AVDEVICE_DECKLINK_ENC_H
+#define AVDEVICE_DECKLINK_ENC_H
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#include "libavformat/avformat.h"
+
 int ff_decklink_write_header(AVFormatContext *avctx);
 int ff_decklink_write_packet(AVFormatContext *avctx, AVPacket *pkt);
 int ff_decklink_write_trailer(AVFormatContext *avctx);
+int ff_decklink_list_output_devices(AVFormatContext *avctx, struct AVDeviceInfoList *device_list);
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+#endif /* AVDEVICE_DECKLINK_ENC_H */

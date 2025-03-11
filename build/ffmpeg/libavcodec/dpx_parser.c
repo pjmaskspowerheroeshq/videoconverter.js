@@ -25,6 +25,8 @@
  */
 
 #include "libavutil/bswap.h"
+#include "libavutil/common.h"
+
 #include "parser.h"
 
 typedef struct DPXParseContext {
@@ -71,7 +73,7 @@ static int dpx_parse(AVCodecParserContext *s, AVCodecContext *avctx,
         }
     }
 
-    for (;d->pc.frame_start_found && i < buf_size; i++) {
+    for (; d->pc.frame_start_found && i < buf_size; i++) {
         d->pc.state = (d->pc.state << 8) | buf[i];
         d->index++;
         if (d->index == 17) {
@@ -106,7 +108,7 @@ flush:
     return next;
 }
 
-AVCodecParser ff_dpx_parser = {
+const AVCodecParser ff_dpx_parser = {
     .codec_ids      = { AV_CODEC_ID_DPX },
     .priv_data_size = sizeof(DPXParseContext),
     .parser_parse   = dpx_parse,

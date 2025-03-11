@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_CHANNELS 8
+#define MAX_CHANNELS 12
 
 static unsigned int myrnd(unsigned int *seed_ptr, int n)
 {
@@ -109,7 +109,7 @@ static void put32(uint32_t v)
     fputc((v >> 24) & 0xff, outfile);
 }
 
-#define HEADER_SIZE      46
+#define HEADER_SIZE      38
 #define FMT_SIZE         18
 #define SAMPLE_SIZE       2
 #define WFORMAT_PCM  0x0001
@@ -177,7 +177,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if ((ext = strrchr(argv[1], '.')) != NULL && !strcmp(ext, ".wav"))
+    if ((ext = strrchr(argv[1], '.')) && !strcmp(ext, ".wav"))
         put_wav_header(sample_rate, nb_channels, 6 * sample_rate);
 
     /* 1 second of single freq sine at 1000 Hz */

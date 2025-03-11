@@ -62,20 +62,7 @@ int ff_exp2(uint16_t power);
 int ff_log2_q15(uint32_t value);
 
 /**
- * Shift value left or right depending on sign of offset parameter.
- * @param value value to shift
- * @param offset shift offset
- *
- * @return value << offset, if offset>=0; value >> -offset - otherwise
- */
-static inline int bidir_sal(int value, int offset)
-{
-    if(offset < 0) return value >> -offset;
-    else           return value <<  offset;
-}
-
-/**
- * returns the dot product of 2 int16_t vectors.
+ * Calculate the dot product of 2 int16_t vectors.
  * @param a input data array
  * @param b input data array
  * @param length number of elements
@@ -83,6 +70,19 @@ static inline int bidir_sal(int value, int offset)
  * @return dot product = sum of elementwise products
  */
 int64_t ff_dot_product(const int16_t *a, const int16_t *b, int length);
+
+/**
+ * Shift value left or right depending on sign of offset parameter.
+ * @param value value to shift
+ * @param offset shift offset
+ *
+ * @return value << offset, if offset>=0; value >> -offset - otherwise
+ */
+static inline unsigned bidir_sal(unsigned value, int offset)
+{
+    if(offset < 0) return value >> -offset;
+    else           return value <<  offset;
+}
 
 /**
  * Return the dot product.

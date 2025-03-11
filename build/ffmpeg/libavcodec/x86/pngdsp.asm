@@ -27,11 +27,10 @@ SECTION_RODATA
 
 cextern pw_255
 
-SECTION_TEXT
+SECTION .text
 
-; %1 = nr. of xmm registers used
-%macro ADD_BYTES_FN 1
-cglobal add_bytes_l2, 4, 6, %1, dst, src1, src2, wa, w, i
+INIT_XMM sse2
+cglobal add_bytes_l2, 4, 6, 2, dst, src1, src2, wa, w, i
 %if ARCH_X86_64
     movsxd             waq, wad
 %endif
@@ -42,18 +41,17 @@ cglobal add_bytes_l2, 4, 6, %1, dst, src1, src2, wa, w, i
     and                waq, ~(mmsize*2-1)
     jmp .end_v
 .loop_v:
-    mova                m0, [src1q+iq]
-    mova                m1, [src1q+iq+mmsize]
-    paddb               m0, [src2q+iq]
-    paddb               m1, [src2q+iq+mmsize]
-    mova  [dstq+iq       ], m0
-    mova  [dstq+iq+mmsize], m1
+    movu                m0, [src2q+iq]
+    movu                m1, [src2q+iq+mmsize]
+    paddb               m0, [src1q+iq]
+    paddb               m1, [src1q+iq+mmsize]
+    movu  [dstq+iq       ], m0
+    movu  [dstq+iq+mmsize], m1
     add                 iq, mmsize*2
 .end_v:
     cmp                 iq, waq
     jl .loop_v
 
-%if mmsize == 16
     ; vector loop
     mov                waq, wq
     and                waq, ~7
@@ -66,7 +64,6 @@ cglobal add_bytes_l2, 4, 6, %1, dst, src1, src2, wa, w, i
 .end_l:
     cmp                 iq, waq
     jl .loop_l
-%endif
 
     ; scalar loop for leftover
     jmp .end_s
@@ -78,16 +75,7 @@ cglobal add_bytes_l2, 4, 6, %1, dst, src1, src2, wa, w, i
 .end_s:
     cmp                 iq, wq
     jl .loop_s
-    REP_RET
-%endmacro
-
-%if ARCH_X86_32
-INIT_MMX mmx
-ADD_BYTES_FN 0
-%endif
-
-INIT_XMM sse2
-ADD_BYTES_FN 2
+    RET
 
 %macro ADD_PAETH_PRED_FN 1
 cglobal add_png_paeth_prediction, 5, 7, %1, dst, src, top, w, bpp, end, cntr
@@ -157,7 +145,7 @@ cglobal add_png_paeth_prediction, 5, 7, %1, dst, src, top, w, bpp, end, cntr
     movh            [dstq], m3
     add               dstq, bppq
     cmp               dstq, endq
-    jle .loop
+    jl .loop
 
     mov               dstq, [rsp]
     dec              cntrq

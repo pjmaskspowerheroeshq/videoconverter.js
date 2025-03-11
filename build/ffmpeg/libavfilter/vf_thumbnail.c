@@ -27,9 +27,11 @@
  * @see http://notbrainsurgery.livejournal.com/29773.html
  */
 
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 #define HIST_SIZE (3*256)
 
@@ -38,12 +40,19 @@ struct thumb_frame {
     int histogram[HIST_SIZE];   ///< RGB color distribution histogram of the frame
 };
 
-typedef struct {
+typedef struct ThumbContext {
     const AVClass *class;
     int n;                      ///< current frame
+    int loglevel;
     int n_frames;               ///< number of frames for analysis
     struct thumb_frame *frames; ///< the n_frames frames
     AVRational tb;              ///< copy of the input timebase to ease access
+
+    int nb_threads;
+    int *thread_histogram;
+
+    int planewidth[4];
+    int planeheight[4];
 } ThumbContext;
 
 #define OFFSET(x) offsetof(ThumbContext, x)
@@ -51,6 +60,10 @@ typedef struct {
 
 static const AVOption thumbnail_options[] = {
     { "n", "set the frames batch size", OFFSET(n_frames), AV_OPT_TYPE_INT, {.i64=100}, 2, INT_MAX, FLAGS },
+    { "log", "force stats logging level", OFFSET(loglevel), AV_OPT_TYPE_INT, {.i64 = AV_LOG_INFO}, INT_MIN, INT_MAX, FLAGS, .unit = "level" },
+        { "quiet",   "logging disabled",          0, AV_OPT_TYPE_CONST, {.i64 = AV_LOG_QUIET},   0, 0, FLAGS, .unit = "level" },
+        { "info",    "information logging level", 0, AV_OPT_TYPE_CONST, {.i64 = AV_LOG_INFO},    0, 0, FLAGS, .unit = "level" },
+        { "verbose", "verbose logging level",     0, AV_OPT_TYPE_CONST, {.i64 = AV_LOG_VERBOSE}, 0, 0, FLAGS, .unit = "level" },
     { NULL }
 };
 
@@ -58,15 +71,15 @@ AVFILTER_DEFINE_CLASS(thumbnail);
 
 static av_cold int init(AVFilterContext *ctx)
 {
-    ThumbContext *thumb = ctx->priv;
+    ThumbContext *s = ctx->priv;
 
-    thumb->frames = av_calloc(thumb->n_frames, sizeof(*thumb->frames));
-    if (!thumb->frames) {
+    s->frames = av_calloc(s->n_frames, sizeof(*s->frames));
+    if (!s->frames) {
         av_log(ctx, AV_LOG_ERROR,
                "Allocation failure, try to lower the number of frames\n");
         return AVERROR(ENOMEM);
     }
-    av_log(ctx, AV_LOG_VERBOSE, "batch size: %d frames\n", thumb->n_frames);
+    av_log(ctx, AV_LOG_VERBOSE, "batch size: %d frames\n", s->n_frames);
     return 0;
 }
 
@@ -91,68 +104,140 @@ static double frame_sum_square_err(const int *hist, const double *median)
 static AVFrame *get_best_frame(AVFilterContext *ctx)
 {
     AVFrame *picref;
-    ThumbContext *thumb = ctx->priv;
+    ThumbContext *s = ctx->priv;
     int i, j, best_frame_idx = 0;
-    int nb_frames = thumb->n;
+    int nb_frames = s->n;
     double avg_hist[HIST_SIZE] = {0}, sq_err, min_sq_err = -1;
 
     // average histogram of the N frames
     for (j = 0; j < FF_ARRAY_ELEMS(avg_hist); j++) {
         for (i = 0; i < nb_frames; i++)
-            avg_hist[j] += (double)thumb->frames[i].histogram[j];
+            avg_hist[j] += (double)s->frames[i].histogram[j];
         avg_hist[j] /= nb_frames;
     }
 
     // find the frame closer to the average using the sum of squared errors
     for (i = 0; i < nb_frames; i++) {
-        sq_err = frame_sum_square_err(thumb->frames[i].histogram, avg_hist);
+        sq_err = frame_sum_square_err(s->frames[i].histogram, avg_hist);
         if (i == 0 || sq_err < min_sq_err)
             best_frame_idx = i, min_sq_err = sq_err;
     }
 
     // free and reset everything (except the best frame buffer)
     for (i = 0; i < nb_frames; i++) {
-        memset(thumb->frames[i].histogram, 0, sizeof(thumb->frames[i].histogram));
+        memset(s->frames[i].histogram, 0, sizeof(s->frames[i].histogram));
         if (i != best_frame_idx)
-            av_frame_free(&thumb->frames[i].buf);
+            av_frame_free(&s->frames[i].buf);
     }
-    thumb->n = 0;
+    s->n = 0;
 
     // raise the chosen one
-    picref = thumb->frames[best_frame_idx].buf;
-    av_log(ctx, AV_LOG_INFO, "frame id #%d (pts_time=%f) selected "
-           "from a set of %d images\n", best_frame_idx,
-           picref->pts * av_q2d(thumb->tb), nb_frames);
-    thumb->frames[best_frame_idx].buf = NULL;
+    picref = s->frames[best_frame_idx].buf;
+    if (s->loglevel != AV_LOG_QUIET)
+        av_log(ctx, s->loglevel, "frame id #%d (pts_time=%f) selected "
+               "from a set of %d images\n", best_frame_idx,
+               picref->pts * av_q2d(s->tb), nb_frames);
+    s->frames[best_frame_idx].buf = NULL;
 
     return picref;
 }
 
+static int do_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
+{
+    ThumbContext *s = ctx->priv;
+    AVFrame *frame = arg;
+    int *hist = s->thread_histogram + HIST_SIZE * jobnr;
+    const int h = frame->height;
+    const int w = frame->width;
+    const int slice_start = (h * jobnr) / nb_jobs;
+    const int slice_end = (h * (jobnr+1)) / nb_jobs;
+    const uint8_t *p = frame->data[0] + slice_start * frame->linesize[0];
+
+    memset(hist, 0, sizeof(*hist) * HIST_SIZE);
+
+    switch (frame->format) {
+    case AV_PIX_FMT_RGB24:
+    case AV_PIX_FMT_BGR24:
+        for (int j = slice_start; j < slice_end; j++) {
+            for (int i = 0; i < w; i++) {
+                hist[0*256 + p[i*3    ]]++;
+                hist[1*256 + p[i*3 + 1]]++;
+                hist[2*256 + p[i*3 + 2]]++;
+            }
+            p += frame->linesize[0];
+        }
+        break;
+    case AV_PIX_FMT_RGB0:
+    case AV_PIX_FMT_BGR0:
+    case AV_PIX_FMT_RGBA:
+    case AV_PIX_FMT_BGRA:
+        for (int j = slice_start; j < slice_end; j++) {
+            for (int i = 0; i < w; i++) {
+                hist[0*256 + p[i*4    ]]++;
+                hist[1*256 + p[i*4 + 1]]++;
+                hist[2*256 + p[i*4 + 2]]++;
+            }
+            p += frame->linesize[0];
+        }
+        break;
+    case AV_PIX_FMT_0RGB:
+    case AV_PIX_FMT_0BGR:
+    case AV_PIX_FMT_ARGB:
+    case AV_PIX_FMT_ABGR:
+        for (int j = slice_start; j < slice_end; j++) {
+            for (int i = 0; i < w; i++) {
+                hist[0*256 + p[i*4 + 1]]++;
+                hist[1*256 + p[i*4 + 2]]++;
+                hist[2*256 + p[i*4 + 3]]++;
+            }
+            p += frame->linesize[0];
+        }
+        break;
+    default:
+        for (int plane = 0; plane < 3; plane++) {
+            const int slice_start = (s->planeheight[plane] * jobnr) / nb_jobs;
+            const int slice_end = (s->planeheight[plane] * (jobnr+1)) / nb_jobs;
+            const uint8_t *p = frame->data[plane] + slice_start * frame->linesize[plane];
+            const ptrdiff_t linesize = frame->linesize[plane];
+            const int planewidth = s->planewidth[plane];
+            int *hhist = hist + 256 * plane;
+
+            for (int j = slice_start; j < slice_end; j++) {
+                for (int i = 0; i < planewidth; i++)
+                    hhist[p[i]]++;
+                p += linesize;
+            }
+        }
+        break;
+    }
+
+    return 0;
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
-    int i, j;
     AVFilterContext *ctx  = inlink->dst;
-    ThumbContext *thumb   = ctx->priv;
+    ThumbContext *s   = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
-    int *hist = thumb->frames[thumb->n].histogram;
-    const uint8_t *p = frame->data[0];
+    int *hist = s->frames[s->n].histogram;
 
     // keep a reference of each frame
-    thumb->frames[thumb->n].buf = frame;
+    s->frames[s->n].buf = frame;
 
-    // update current frame RGB histogram
-    for (j = 0; j < inlink->h; j++) {
-        for (i = 0; i < inlink->w; i++) {
-            hist[0*256 + p[i*3    ]]++;
-            hist[1*256 + p[i*3 + 1]]++;
-            hist[2*256 + p[i*3 + 2]]++;
-        }
-        p += frame->linesize[0];
+    ff_filter_execute(ctx, do_slice, frame, NULL,
+                      FFMIN(frame->height, s->nb_threads));
+
+    // update current frame histogram
+    for (int j = 0; j < FFMIN(frame->height, s->nb_threads); j++) {
+        int *thread_histogram = s->thread_histogram + HIST_SIZE * j;
+
+        for (int i = 0; i < HIST_SIZE; i++)
+            hist[i] += thread_histogram[i];
     }
 
     // no selection until the buffer of N frames is filled up
-    thumb->n++;
-    if (thumb->n < thumb->n_frames)
+    s->n++;
+    if (s->n < s->n_frames)
         return 0;
 
     return ff_filter_frame(outlink, get_best_frame(ctx));
@@ -161,51 +246,66 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
 static av_cold void uninit(AVFilterContext *ctx)
 {
     int i;
-    ThumbContext *thumb = ctx->priv;
-    for (i = 0; i < thumb->n_frames && thumb->frames[i].buf; i++)
-        av_frame_free(&thumb->frames[i].buf);
-    av_freep(&thumb->frames);
+    ThumbContext *s = ctx->priv;
+    for (i = 0; i < s->n_frames && s->frames && s->frames[i].buf; i++)
+        av_frame_free(&s->frames[i].buf);
+    av_freep(&s->frames);
+    av_freep(&s->thread_histogram);
 }
 
 static int request_frame(AVFilterLink *link)
 {
     AVFilterContext *ctx = link->src;
-    ThumbContext *thumb = ctx->priv;
+    ThumbContext *s = ctx->priv;
+    int ret = ff_request_frame(ctx->inputs[0]);
 
-    /* loop until a frame thumbnail is available (when a frame is queued,
-     * thumb->n is reset to zero) */
-    do {
-        int ret = ff_request_frame(ctx->inputs[0]);
-        if (ret == AVERROR_EOF && thumb->n) {
-            ret = ff_filter_frame(link, get_best_frame(ctx));
-            if (ret < 0)
-                return ret;
-            ret = AVERROR_EOF;
-        }
+    if (ret == AVERROR_EOF && s->n) {
+        ret = ff_filter_frame(link, get_best_frame(ctx));
         if (ret < 0)
             return ret;
-    } while (thumb->n);
+        ret = AVERROR_EOF;
+    }
+    if (ret < 0)
+        return ret;
     return 0;
 }
 
 static int config_props(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
-    ThumbContext *thumb = ctx->priv;
+    ThumbContext *s = ctx->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
 
-    thumb->tb = inlink->time_base;
+    s->nb_threads = ff_filter_get_nb_threads(ctx);
+    s->thread_histogram = av_calloc(HIST_SIZE, s->nb_threads * sizeof(*s->thread_histogram));
+    if (!s->thread_histogram)
+        return AVERROR(ENOMEM);
+
+    s->tb = inlink->time_base;
+    s->planewidth[1]  = s->planewidth[2]  = AV_CEIL_RSHIFT(inlink->w, desc->log2_chroma_w);
+    s->planewidth[0]  = s->planewidth[3]  = inlink->w;
+    s->planeheight[1] = s->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
+    s->planeheight[0] = s->planeheight[3] = inlink->h;
+
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
-        AV_PIX_FMT_NONE
-    };
-    ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
-    return 0;
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
+    AV_PIX_FMT_RGBA,  AV_PIX_FMT_BGRA,
+    AV_PIX_FMT_RGB0,  AV_PIX_FMT_BGR0,
+    AV_PIX_FMT_ABGR,  AV_PIX_FMT_ARGB,
+    AV_PIX_FMT_0BGR,  AV_PIX_FMT_0RGB,
+    AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P,
+    AV_PIX_FMT_YUVJ440P, AV_PIX_FMT_YUVJ444P,
+    AV_PIX_FMT_YUVJ411P,
+    AV_PIX_FMT_YUVA420P, AV_PIX_FMT_YUVA422P, AV_PIX_FMT_YUVA444P,
+    AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP,
+    AV_PIX_FMT_NONE
+};
 
 static const AVFilterPad thumbnail_inputs[] = {
     {
@@ -214,7 +314,6 @@ static const AVFilterPad thumbnail_inputs[] = {
         .config_props = config_props,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad thumbnail_outputs[] = {
@@ -223,17 +322,18 @@ static const AVFilterPad thumbnail_outputs[] = {
         .type          = AVMEDIA_TYPE_VIDEO,
         .request_frame = request_frame,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_thumbnail = {
+const AVFilter ff_vf_thumbnail = {
     .name          = "thumbnail",
     .description   = NULL_IF_CONFIG_SMALL("Select the most representative frame in a given sequence of consecutive frames."),
     .priv_size     = sizeof(ThumbContext),
     .init          = init,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = thumbnail_inputs,
-    .outputs       = thumbnail_outputs,
+    FILTER_INPUTS(thumbnail_inputs),
+    FILTER_OUTPUTS(thumbnail_outputs),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
     .priv_class    = &thumbnail_class,
+    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
+                     AVFILTER_FLAG_SLICE_THREADS,
 };

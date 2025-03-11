@@ -27,8 +27,8 @@ SECTION .text
 %if lut_bits != 8
     sar    %1q, 8-lut_bits
 %endif
-    movsx  %1d, word [%3q+%1q*2]
-    add    %1d, %2d
+    movsx  %1q, word [%3q+%1q*2]
+    add    %1q, %2q
 %endmacro
 
 %macro LOAD 3 ; dstreg, x, bitdepth
@@ -97,7 +97,7 @@ ALIGN 16
     inc    xq
     jl .loop
     je .loop2
-    REP_RET
+    RET
 %endmacro ; HQDN3D_ROW
 
 HQDN3D_ROW 8

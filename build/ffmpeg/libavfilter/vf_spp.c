@@ -31,13 +31,17 @@
  * ported by Clément Bœsch for FFmpeg.
  */
 
-#include "libavcodec/dsputil.h"
-#include "libavutil/avassert.h"
+#include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "qp_table.h"
 #include "vf_spp.h"
+#include "video.h"
 
 enum mode {
     MODE_HARD,
@@ -45,19 +49,41 @@ enum mode {
     NB_MODES
 };
 
+static const AVClass *child_class_iterate(void **iter)
+{
+    const AVClass *c = *iter ? NULL : avcodec_dct_get_class();
+    *iter = (void*)(uintptr_t)c;
+    return c;
+}
+
+static void *child_next(void *obj, void *prev)
+{
+    SPPContext *s = obj;
+    return prev ? NULL : s->dct;
+}
+
 #define OFFSET(x) offsetof(SPPContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+#define TFLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 static const AVOption spp_options[] = {
-    { "quality", "set quality", OFFSET(log2_count), AV_OPT_TYPE_INT, {.i64 = 3}, 0, MAX_LEVEL, FLAGS },
+    { "quality", "set quality", OFFSET(log2_count), AV_OPT_TYPE_INT, {.i64 = 3}, 0, MAX_LEVEL, TFLAGS },
     { "qp", "force a constant quantizer parameter", OFFSET(qp), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 63, FLAGS },
-    { "mode", "set thresholding mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64 = MODE_HARD}, 0, NB_MODES - 1, FLAGS, "mode" },
-        { "hard", "hard thresholding", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_HARD}, INT_MIN, INT_MAX, FLAGS, "mode" },
-        { "soft", "soft thresholding", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_SOFT}, INT_MIN, INT_MAX, FLAGS, "mode" },
-    { "use_bframe_qp", "use B-frames' QP", OFFSET(use_bframe_qp), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, FLAGS },
+    { "mode", "set thresholding mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64 = MODE_HARD}, 0, NB_MODES - 1, FLAGS, .unit = "mode" },
+        { "hard", "hard thresholding", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_HARD}, INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
+        { "soft", "soft thresholding", 0, AV_OPT_TYPE_CONST, {.i64 = MODE_SOFT}, INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
+    { "use_bframe_qp", "use B-frames' QP", OFFSET(use_bframe_qp), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(spp);
+static const AVClass spp_class = {
+    .class_name       = "spp",
+    .item_name        = av_default_item_name,
+    .option           = spp_options,
+    .version          = LIBAVUTIL_VERSION_INT,
+    .category         = AV_CLASS_CATEGORY_FILTER,
+    .child_class_iterate = child_class_iterate,
+    .child_next       = child_next,
+};
 
 // XXX: share between filters?
 DECLARE_ALIGNED(8, static const uint8_t, ldither)[8][8] = {
@@ -71,7 +97,8 @@ DECLARE_ALIGNED(8, static const uint8_t, ldither)[8][8] = {
     { 42,  26,  38,  22,  41,  25,  37,  21 },
 };
 
-static const uint8_t offset[127][2] = {
+static const uint8_t offset[128][2] = {
+    {0,0},                                                  // unused
     {0,0},
     {0,0}, {4,4},                                           // quality = 1
     {0,0}, {2,2}, {6,4}, {4,6},                             // quality = 2
@@ -146,7 +173,7 @@ static void store_slice_c(uint8_t *dst, const int16_t *src,
     int y, x;
 
 #define STORE(pos) do {                                                     \
-    temp = ((src[x + y*src_linesize + pos] << log2_scale) + d[pos]) >> 6;   \
+    temp = (src[x + y*src_linesize + pos] * (1 << log2_scale) + d[pos]) >> 6;\
     if (temp & 0x100)                                                       \
         temp = ~(temp >> 31);                                               \
     dst[x + y*dst_linesize + pos] = temp;                                   \
@@ -168,33 +195,56 @@ static void store_slice_c(uint8_t *dst, const int16_t *src,
     }
 }
 
-static inline void add_block(int16_t *dst, int linesize, const int16_t block[64])
+static void store_slice16_c(uint16_t *dst, const int16_t *src,
+                            int dst_linesize, int src_linesize,
+                            int width, int height, int log2_scale,
+                            const uint8_t dither[8][8], int depth)
+{
+    int y, x;
+    unsigned int mask = -1<<depth;
+
+#define STORE16(pos) do {                                                   \
+    temp = (src[x + y*src_linesize + pos] * (1 << log2_scale) + (d[pos]>>1)) >> 5; \
+    if (temp & mask )                                                       \
+        temp = ~(temp >> 31);                                               \
+    dst[x + y*dst_linesize + pos] = temp;                                   \
+} while (0)
+
+    for (y = 0; y < height; y++) {
+        const uint8_t *d = dither[y];
+        for (x = 0; x < width; x += 8) {
+            int temp;
+            STORE16(0);
+            STORE16(1);
+            STORE16(2);
+            STORE16(3);
+            STORE16(4);
+            STORE16(5);
+            STORE16(6);
+            STORE16(7);
+        }
+    }
+}
+
+static inline void add_block(uint16_t *dst, int linesize, const int16_t block[64])
 {
     int y;
 
     for (y = 0; y < 8; y++) {
-        *(uint32_t *)&dst[0 + y*linesize] += *(uint32_t *)&block[0 + y*8];
-        *(uint32_t *)&dst[2 + y*linesize] += *(uint32_t *)&block[2 + y*8];
-        *(uint32_t *)&dst[4 + y*linesize] += *(uint32_t *)&block[4 + y*8];
-        *(uint32_t *)&dst[6 + y*linesize] += *(uint32_t *)&block[6 + y*8];
+        dst[0 + y*linesize] += block[0 + y*8];
+        dst[1 + y*linesize] += block[1 + y*8];
+        dst[2 + y*linesize] += block[2 + y*8];
+        dst[3 + y*linesize] += block[3 + y*8];
+        dst[4 + y*linesize] += block[4 + y*8];
+        dst[5 + y*linesize] += block[5 + y*8];
+        dst[6 + y*linesize] += block[6 + y*8];
+        dst[7 + y*linesize] += block[7 + y*8];
     }
-}
-
-// XXX: export the function?
-static inline int norm_qscale(int qscale, int type)
-{
-    switch (type) {
-    case FF_QSCALE_TYPE_MPEG1: return qscale;
-    case FF_QSCALE_TYPE_MPEG2: return qscale >> 1;
-    case FF_QSCALE_TYPE_H264:  return qscale >> 2;
-    case FF_QSCALE_TYPE_VP56:  return (63 - qscale + 2) >> 2;
-    }
-    return qscale;
 }
 
 static void filter(SPPContext *p, uint8_t *dst, uint8_t *src,
                    int dst_linesize, int src_linesize, int width, int height,
-                   const uint8_t *qp_table, int qp_stride, int is_luma)
+                   const uint8_t *qp_table, int qp_stride, int is_luma, int depth)
 {
     int x, y, i;
     const int count = 1 << p->log2_count;
@@ -202,18 +252,27 @@ static void filter(SPPContext *p, uint8_t *dst, uint8_t *src,
     DECLARE_ALIGNED(16, uint64_t, block_align)[32];
     int16_t *block  = (int16_t *)block_align;
     int16_t *block2 = (int16_t *)(block_align + 16);
+    uint16_t *psrc16 = (uint16_t*)p->src;
+    const int sample_bytes = (depth+7) / 8;
 
     for (y = 0; y < height; y++) {
         int index = 8 + 8*linesize + y*linesize;
-        memcpy(p->src + index, src + y*src_linesize, width);
-        for (x = 0; x < 8; x++) {
-            p->src[index         - x - 1] = p->src[index +         x    ];
-            p->src[index + width + x    ] = p->src[index + width - x - 1];
+        memcpy(p->src + index*sample_bytes, src + y*src_linesize, width*sample_bytes);
+        if (sample_bytes == 1) {
+            for (x = 0; x < 8; x++) {
+                p->src[index         - x - 1] = p->src[index +         x    ];
+                p->src[index + width + x    ] = p->src[index + width - x - 1];
+            }
+        } else {
+            for (x = 0; x < 8; x++) {
+                psrc16[index         - x - 1] = psrc16[index +         x    ];
+                psrc16[index + width + x    ] = psrc16[index + width - x - 1];
+            }
         }
     }
     for (y = 0; y < 8; y++) {
-        memcpy(p->src + (       7-y)*linesize, p->src + (       y+8)*linesize, linesize);
-        memcpy(p->src + (height+8+y)*linesize, p->src + (height-y+7)*linesize, linesize);
+        memcpy(p->src + (       7-y)*linesize * sample_bytes, p->src + (       y+8)*linesize * sample_bytes, linesize * sample_bytes);
+        memcpy(p->src + (height+8+y)*linesize * sample_bytes, p->src + (height-y+7)*linesize * sample_bytes, linesize * sample_bytes);
     }
 
     for (y = 0; y < height + 8; y += 8) {
@@ -226,60 +285,79 @@ static void filter(SPPContext *p, uint8_t *dst, uint8_t *src,
             } else{
                 const int qps = 3 + is_luma;
                 qp = qp_table[(FFMIN(x, width - 1) >> qps) + (FFMIN(y, height - 1) >> qps) * qp_stride];
-                qp = FFMAX(1, norm_qscale(qp, p->qscale_type));
+                qp = FFMAX(1, ff_norm_qscale(qp, p->qscale_type));
             }
             for (i = 0; i < count; i++) {
-                const int x1 = x + offset[i + count - 1][0];
-                const int y1 = y + offset[i + count - 1][1];
+                const int x1 = x + offset[i + count][0];
+                const int y1 = y + offset[i + count][1];
                 const int index = x1 + y1*linesize;
-                p->pdsp.get_pixels(block, p->src + index, linesize);
-                p->fdsp.fdct(block);
-                p->requantize(block2, block, qp, p->idsp.idct_permutation);
-                p->idsp.idct(block2);
+                p->dct->get_pixels_unaligned(block, p->src + sample_bytes*index, sample_bytes*linesize);
+                p->dct->fdct(block);
+                p->requantize(block2, block, qp, p->dct->idct_permutation);
+                p->dct->idct(block2);
                 add_block(p->temp + index, linesize, block2);
             }
         }
-        if (y)
-            p->store_slice(dst + (y - 8) * dst_linesize, p->temp + 8 + y*linesize,
-                           dst_linesize, linesize, width,
-                           FFMIN(8, height + 8 - y), MAX_LEVEL - p->log2_count,
-                           ldither);
+        if (y) {
+            if (sample_bytes == 1) {
+                p->store_slice(dst + (y - 8) * dst_linesize, p->temp + 8 + y*linesize,
+                               dst_linesize, linesize, width,
+                               FFMIN(8, height + 8 - y), MAX_LEVEL - p->log2_count,
+                               ldither);
+            } else {
+                store_slice16_c((uint16_t*)(dst + (y - 8) * dst_linesize), p->temp + 8 + y*linesize,
+                                dst_linesize/2, linesize, width,
+                                FFMIN(8, height + 8 - y), MAX_LEVEL - p->log2_count,
+                                ldither, depth);
+            }
+        }
     }
 }
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum PixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,
-        AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P,
-        AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_NONE
-    };
-    ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
-    return 0;
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV411P,
+    AV_PIX_FMT_YUV410P,  AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ422P,
+    AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_YUV444P10,  AV_PIX_FMT_YUV422P10,
+    AV_PIX_FMT_YUV420P10,
+    AV_PIX_FMT_YUV444P9,  AV_PIX_FMT_YUV422P9,
+    AV_PIX_FMT_YUV420P9,
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_GBRP,
+    AV_PIX_FMT_GBRP9,
+    AV_PIX_FMT_GBRP10,
+    AV_PIX_FMT_NONE
+};
 
 static int config_input(AVFilterLink *inlink)
 {
-    SPPContext *spp = inlink->dst->priv;
+    SPPContext *s = inlink->dst->priv;
     const int h = FFALIGN(inlink->h + 16, 16);
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    const int bps = desc->comp[0].depth;
 
-    spp->hsub = desc->log2_chroma_w;
-    spp->vsub = desc->log2_chroma_h;
-    spp->temp_linesize = FFALIGN(inlink->w + 16, 16);
-    spp->temp = av_malloc_array(spp->temp_linesize, h * sizeof(*spp->temp));
-    spp->src  = av_malloc_array(spp->temp_linesize, h * sizeof(*spp->src));
-    if (!spp->use_bframe_qp) {
-        /* we are assuming here the qp blocks will not be smaller that 16x16 */
-        spp->non_b_qp_alloc_size = FF_CEIL_RSHIFT(inlink->w, 4) * FF_CEIL_RSHIFT(inlink->h, 4);
-        spp->non_b_qp_table = av_calloc(spp->non_b_qp_alloc_size, sizeof(*spp->non_b_qp_table));
-        if (!spp->non_b_qp_table)
-            return AVERROR(ENOMEM);
+    s->store_slice = store_slice_c;
+    switch (s->mode) {
+    case MODE_HARD: s->requantize = hardthresh_c; break;
+    case MODE_SOFT: s->requantize = softthresh_c; break;
     }
-    if (!spp->temp || !spp->src)
+
+    av_opt_set_int(s->dct, "bits_per_sample", bps, 0);
+    avcodec_dct_init(s->dct);
+
+#if ARCH_X86
+    ff_spp_init_x86(s);
+#endif
+
+    s->hsub = desc->log2_chroma_w;
+    s->vsub = desc->log2_chroma_h;
+    s->temp_linesize = FFALIGN(inlink->w + 16, 16);
+    s->temp = av_malloc_array(s->temp_linesize, h * sizeof(*s->temp));
+    s->src  = av_malloc_array(s->temp_linesize, h * sizeof(*s->src) * 2);
+
+    if (!s->temp || !s->src)
         return AVERROR(ENOMEM);
     return 0;
 }
@@ -287,43 +365,42 @@ static int config_input(AVFilterLink *inlink)
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
-    SPPContext *spp = ctx->priv;
+    SPPContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
     AVFrame *out = in;
     int qp_stride = 0;
-    const int8_t *qp_table = NULL;
+    int8_t *qp_table = NULL;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    const int depth = desc->comp[0].depth;
+    int ret = 0;
 
     /* if we are not in a constant user quantizer mode and we don't want to use
      * the quantizers from the B-frames (B-frames often have a higher QP), we
      * need to save the qp table from the last non B-frame; this is what the
      * following code block does */
-    if (!spp->qp) {
-        qp_table = av_frame_get_qp_table(in, &qp_stride, &spp->qscale_type);
+    if (!s->qp && (s->use_bframe_qp || in->pict_type != AV_PICTURE_TYPE_B)) {
+        ret = ff_qp_table_extract(in, &qp_table, &qp_stride, NULL, &s->qscale_type);
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
 
-        if (qp_table && !spp->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
-            int w, h;
-
-            /* if the qp stride is not set, it means the QP are only defined on
-             * a line basis */
-            if (!qp_stride) {
-                w = FF_CEIL_RSHIFT(inlink->w, 4);
-                h = 1;
-            } else {
-                w = FF_CEIL_RSHIFT(qp_stride, 4);
-                h = FF_CEIL_RSHIFT(inlink->h, 4);
-            }
-            av_assert0(w * h <= spp->non_b_qp_alloc_size);
-            memcpy(spp->non_b_qp_table, qp_table, w * h);
+        if (!s->use_bframe_qp && in->pict_type != AV_PICTURE_TYPE_B) {
+            av_freep(&s->non_b_qp_table);
+            s->non_b_qp_table  = qp_table;
+            s->non_b_qp_stride = qp_stride;
         }
     }
 
-    if (spp->log2_count && !ctx->is_disabled) {
-        if (!spp->use_bframe_qp && spp->non_b_qp_table)
-            qp_table = spp->non_b_qp_table;
+    if (s->log2_count && !ctx->is_disabled) {
+        if (!s->use_bframe_qp && s->non_b_qp_table) {
+            qp_table  = s->non_b_qp_table;
+            qp_stride = s->non_b_qp_stride;
+        }
 
-        if (qp_table || spp->qp) {
-            const int cw = FF_CEIL_RSHIFT(inlink->w, spp->hsub);
-            const int ch = FF_CEIL_RSHIFT(inlink->h, spp->vsub);
+        if (qp_table || s->qp) {
+            const int cw = AV_CEIL_RSHIFT(inlink->w, s->hsub);
+            const int ch = AV_CEIL_RSHIFT(inlink->h, s->vsub);
 
             /* get a new frame if in-place is not possible or if the dimensions
              * are not multiple of 8 */
@@ -334,16 +411,20 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 out = ff_get_video_buffer(outlink, aligned_w, aligned_h);
                 if (!out) {
                     av_frame_free(&in);
-                    return AVERROR(ENOMEM);
+                    ret = AVERROR(ENOMEM);
+                    goto finish;
                 }
                 av_frame_copy_props(out, in);
                 out->width  = in->width;
                 out->height = in->height;
             }
 
-            filter(spp, out->data[0], in->data[0], out->linesize[0], in->linesize[0], inlink->w, inlink->h, qp_table, qp_stride, 1);
-            filter(spp, out->data[1], in->data[1], out->linesize[1], in->linesize[1], cw,        ch,        qp_table, qp_stride, 0);
-            filter(spp, out->data[2], in->data[2], out->linesize[2], in->linesize[2], cw,        ch,        qp_table, qp_stride, 0);
+            filter(s, out->data[0], in->data[0], out->linesize[0], in->linesize[0], inlink->w, inlink->h, qp_table, qp_stride, 1, depth);
+
+            if (out->data[2]) {
+                filter(s, out->data[1], in->data[1], out->linesize[1], in->linesize[1], cw,        ch,        qp_table, qp_stride, 0, depth);
+                filter(s, out->data[2], in->data[2], out->linesize[2], in->linesize[2], cw,        ch,        qp_table, qp_stride, 0, depth);
+            }
             emms_c();
         }
     }
@@ -355,55 +436,47 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                 inlink->w, inlink->h);
         av_frame_free(&in);
     }
-    return ff_filter_frame(outlink, out);
+    ret = ff_filter_frame(outlink, out);
+finish:
+    if (qp_table != s->non_b_qp_table)
+        av_freep(&qp_table);
+    return ret;
 }
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
                            char *res, int res_len, int flags)
 {
-    SPPContext *spp = ctx->priv;
+    SPPContext *s = ctx->priv;
 
-    if (!strcmp(cmd, "level")) {
+    if (!strcmp(cmd, "level") || !strcmp(cmd, "quality")) {
         if (!strcmp(args, "max"))
-            spp->log2_count = MAX_LEVEL;
+            s->log2_count = MAX_LEVEL;
         else
-            spp->log2_count = av_clip(strtol(args, NULL, 10), 0, MAX_LEVEL);
+            s->log2_count = av_clip(strtol(args, NULL, 10), 0, MAX_LEVEL);
         return 0;
     }
     return AVERROR(ENOSYS);
 }
 
-static av_cold int init(AVFilterContext *ctx)
+static av_cold int preinit(AVFilterContext *ctx)
 {
-    SPPContext *spp = ctx->priv;
+    SPPContext *s = ctx->priv;
 
-    spp->avctx = avcodec_alloc_context3(NULL);
-    if (!spp->avctx)
+    s->dct = avcodec_dct_alloc();
+    if (!s->dct)
         return AVERROR(ENOMEM);
-    ff_idctdsp_init(&spp->idsp, spp->avctx);
-    ff_fdctdsp_init(&spp->fdsp, spp->avctx);
-    ff_pixblockdsp_init(&spp->pdsp, spp->avctx);
-    spp->store_slice = store_slice_c;
-    switch (spp->mode) {
-    case MODE_HARD: spp->requantize = hardthresh_c; break;
-    case MODE_SOFT: spp->requantize = softthresh_c; break;
-    }
-    if (ARCH_X86)
-        ff_spp_init_x86(spp);
+
     return 0;
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
-    SPPContext *spp = ctx->priv;
+    SPPContext *s = ctx->priv;
 
-    av_freep(&spp->temp);
-    av_freep(&spp->src);
-    if (spp->avctx) {
-        avcodec_close(spp->avctx);
-        av_freep(&spp->avctx);
-    }
-    av_freep(&spp->non_b_qp_table);
+    av_freep(&s->temp);
+    av_freep(&s->src);
+    av_freep(&s->dct);
+    av_freep(&s->non_b_qp_table);
 }
 
 static const AVFilterPad spp_inputs[] = {
@@ -413,26 +486,17 @@ static const AVFilterPad spp_inputs[] = {
         .config_props = config_input,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad spp_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_spp = {
+const AVFilter ff_vf_spp = {
     .name            = "spp",
     .description     = NULL_IF_CONFIG_SMALL("Apply a simple post processing filter."),
     .priv_size       = sizeof(SPPContext),
-    .init            = init,
+    .preinit         = preinit,
     .uninit          = uninit,
-    .query_formats   = query_formats,
-    .inputs          = spp_inputs,
-    .outputs         = spp_outputs,
+    FILTER_INPUTS(spp_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
     .process_command = process_command,
     .priv_class      = &spp_class,
     .flags           = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,

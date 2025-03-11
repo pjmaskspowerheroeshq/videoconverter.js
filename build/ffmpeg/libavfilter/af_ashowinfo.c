@@ -24,22 +24,21 @@
  */
 
 #include <inttypes.h>
-#include <stddef.h>
 
 #include "libavutil/adler32.h"
 #include "libavutil/attributes.h"
 #include "libavutil/channel_layout.h"
-#include "libavutil/common.h"
 #include "libavutil/downmix_info.h"
-#include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 #include "libavutil/replaygain.h"
 #include "libavutil/timestamp.h"
 #include "libavutil/samplefmt.h"
 
+#include "libavcodec/defs.h"
+
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct AShowInfoContext {
     /**
@@ -142,24 +141,50 @@ static void dump_replaygain(AVFilterContext *ctx, AVFrameSideData *sd)
     print_peak(ctx, "album peak", rg->album_peak);
 }
 
+static void dump_audio_service_type(AVFilterContext *ctx, AVFrameSideData *sd)
+{
+    enum AVAudioServiceType *ast;
+
+    av_log(ctx, AV_LOG_INFO, "audio service type: ");
+    if (sd->size < sizeof(*ast)) {
+        av_log(ctx, AV_LOG_INFO, "invalid data");
+        return;
+    }
+    ast = (enum AVAudioServiceType*)sd->data;
+    switch (*ast) {
+    case AV_AUDIO_SERVICE_TYPE_MAIN:              av_log(ctx, AV_LOG_INFO, "Main Audio Service"); break;
+    case AV_AUDIO_SERVICE_TYPE_EFFECTS:           av_log(ctx, AV_LOG_INFO, "Effects");            break;
+    case AV_AUDIO_SERVICE_TYPE_VISUALLY_IMPAIRED: av_log(ctx, AV_LOG_INFO, "Visually Impaired");  break;
+    case AV_AUDIO_SERVICE_TYPE_HEARING_IMPAIRED:  av_log(ctx, AV_LOG_INFO, "Hearing Impaired");   break;
+    case AV_AUDIO_SERVICE_TYPE_DIALOGUE:          av_log(ctx, AV_LOG_INFO, "Dialogue");           break;
+    case AV_AUDIO_SERVICE_TYPE_COMMENTARY:        av_log(ctx, AV_LOG_INFO, "Commentary");         break;
+    case AV_AUDIO_SERVICE_TYPE_EMERGENCY:         av_log(ctx, AV_LOG_INFO, "Emergency");          break;
+    case AV_AUDIO_SERVICE_TYPE_VOICE_OVER:        av_log(ctx, AV_LOG_INFO, "Voice Over");         break;
+    case AV_AUDIO_SERVICE_TYPE_KARAOKE:           av_log(ctx, AV_LOG_INFO, "Karaoke");            break;
+    default:                                      av_log(ctx, AV_LOG_INFO, "unknown");            break;
+    }
+}
+
 static void dump_unknown(AVFilterContext *ctx, AVFrameSideData *sd)
 {
-    av_log(ctx, AV_LOG_INFO, "unknown side data type: %d, size %d bytes", sd->type, sd->size);
+    av_log(ctx, AV_LOG_INFO, "unknown side data type: %d, size "
+           "%"SIZE_SPECIFIER" bytes", sd->type, sd->size);
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
 {
+    FilterLink      *inl = ff_filter_link(inlink);
     AVFilterContext *ctx = inlink->dst;
     AShowInfoContext *s  = ctx->priv;
     char chlayout_str[128];
     uint32_t checksum = 0;
-    int channels    = inlink->channels;
+    int channels    = inlink->ch_layout.nb_channels;
     int planar      = av_sample_fmt_is_planar(buf->format);
     int block_align = av_get_bytes_per_sample(buf->format) * (planar ? 1 : channels);
     int data_size   = buf->nb_samples * block_align;
     int planes      = planar ? channels : 1;
     int i;
-    void *tmp_ptr = av_realloc(s->plane_checksums, channels * sizeof(*s->plane_checksums));
+    void *tmp_ptr = av_realloc_array(s->plane_checksums, channels, sizeof(*s->plane_checksums));
 
     if (!tmp_ptr)
         return AVERROR(ENOMEM);
@@ -173,17 +198,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
                        s->plane_checksums[0];
     }
 
-    av_get_channel_layout_string(chlayout_str, sizeof(chlayout_str), -1,
-                                 buf->channel_layout);
+    av_channel_layout_describe(&buf->ch_layout, chlayout_str, sizeof(chlayout_str));
 
     av_log(ctx, AV_LOG_INFO,
-           "n:%"PRId64" pts:%s pts_time:%s pos:%"PRId64" "
+           "n:%"PRId64" pts:%s pts_time:%s "
            "fmt:%s channels:%d chlayout:%s rate:%d nb_samples:%d "
            "checksum:%08"PRIX32" ",
-           inlink->frame_count,
+           inl->frame_count_out,
            av_ts2str(buf->pts), av_ts2timestr(buf->pts, &inlink->time_base),
-           av_frame_get_pkt_pos(buf),
-           av_get_sample_fmt_name(buf->format), av_frame_get_channels(buf), chlayout_str,
+           av_get_sample_fmt_name(buf->format), buf->ch_layout.nb_channels, chlayout_str,
            buf->sample_rate, buf->nb_samples,
            checksum);
 
@@ -200,6 +223,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
         case AV_FRAME_DATA_MATRIXENCODING: dump_matrixenc (ctx, sd); break;
         case AV_FRAME_DATA_DOWNMIX_INFO:   dump_downmix   (ctx, sd); break;
         case AV_FRAME_DATA_REPLAYGAIN:     dump_replaygain(ctx, sd); break;
+        case AV_FRAME_DATA_AUDIO_SERVICE_TYPE: dump_audio_service_type(ctx, sd); break;
         default:                           dump_unknown   (ctx, sd); break;
         }
 
@@ -215,22 +239,14 @@ static const AVFilterPad inputs[] = {
         .type         = AVMEDIA_TYPE_AUDIO,
         .filter_frame = filter_frame,
     },
-    { NULL }
 };
 
-static const AVFilterPad outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-    { NULL }
-};
-
-AVFilter ff_af_ashowinfo = {
+const AVFilter ff_af_ashowinfo = {
     .name        = "ashowinfo",
     .description = NULL_IF_CONFIG_SMALL("Show textual information for each audio frame."),
     .priv_size   = sizeof(AShowInfoContext),
     .uninit      = uninit,
-    .inputs      = inputs,
-    .outputs     = outputs,
+    .flags       = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };

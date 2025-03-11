@@ -19,12 +19,13 @@
  */
 
 #include "libavutil/avassert.h"
+#include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "vf_pullup.h"
 
@@ -42,32 +43,27 @@ static const AVOption pullup_options[] = {
     { "jr", "set right junk size", OFFSET(junk_right), AV_OPT_TYPE_INT, {.i64=1}, 0, INT_MAX, FLAGS },
     { "jt", "set top junk size",   OFFSET(junk_top),   AV_OPT_TYPE_INT, {.i64=4}, 1, INT_MAX, FLAGS },
     { "jb", "set bottom junk size", OFFSET(junk_bottom), AV_OPT_TYPE_INT, {.i64=4}, 1, INT_MAX, FLAGS },
-    { "sb", "set strict breaks", OFFSET(strict_breaks), AV_OPT_TYPE_INT, {.i64=0},-1, 1, FLAGS },
-    { "mp", "set metric plane",  OFFSET(metric_plane),  AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, "mp" },
-    { "y", "luma",        0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "mp" },
-    { "u", "chroma blue", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "mp" },
-    { "v", "chroma red",  0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "mp" },
+    { "sb", "set strict breaks", OFFSET(strict_breaks), AV_OPT_TYPE_BOOL,{.i64=0},-1, 1, FLAGS },
+    { "mp", "set metric plane",  OFFSET(metric_plane),  AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, .unit = "mp" },
+    { "y", "luma",        0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "mp" },
+    { "u", "chroma blue", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "mp" },
+    { "v", "chroma red",  0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, .unit = "mp" },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(pullup);
 
-static int query_formats(AVFilterContext *ctx)
-{
-    static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
-        AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
-        AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV440P,
-        AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
-        AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,
-        AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_GRAY8,
-        AV_PIX_FMT_NONE
-    };
-    ff_set_common_formats(ctx, ff_make_format_list(pix_fmts));
-    return 0;
-}
+static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUVJ444P, AV_PIX_FMT_YUVJ440P,
+    AV_PIX_FMT_YUVJ422P, AV_PIX_FMT_YUVJ420P,
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV440P,
+    AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P,
+    AV_PIX_FMT_YUVJ411P, AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
 
-#define ABS(a) ((a) > 0 ? (a) : -(a))
+#define ABS(a) (((a) ^ ((a) >> 31)) - ((a) >> 31))
 
 static int diff_c(const uint8_t *a, const uint8_t *b, ptrdiff_t s)
 {
@@ -191,9 +187,9 @@ static int config_input(AVFilterLink *inlink)
         return AVERROR(EINVAL);
     }
 
-    s->planeheight[1] = s->planeheight[2] = FF_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
+    s->planeheight[1] = s->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
     s->planeheight[0] = s->planeheight[3] = inlink->h;
-    s->planewidth[1]  = s->planewidth[2]  = FF_CEIL_RSHIFT(inlink->w, desc->log2_chroma_w);
+    s->planewidth[1]  = s->planewidth[2]  = AV_CEIL_RSHIFT(inlink->w, desc->log2_chroma_w);
     s->planewidth[0]  = s->planewidth[3]  = inlink->w;
 
     s->metric_w      = (s->planewidth[mp]  - ((s->junk_left + s->junk_right)  << 3)) >> 3;
@@ -212,14 +208,9 @@ static int config_input(AVFilterLink *inlink)
     s->comb = comb_c;
     s->var  = var_c;
 
-    if (ARCH_X86)
-        ff_pullup_init_x86(s);
-    return 0;
-}
-
-static int config_output(AVFilterLink *outlink)
-{
-    outlink->flags |= FF_LINK_FLAG_REQUEST_LOOP;
+#if ARCH_X86
+    ff_pullup_init_x86(s);
+#endif
     return 0;
 }
 
@@ -389,8 +380,8 @@ static void compute_affinity(PullupContext *s, PullupField *f)
         int v  = f->vars[i];
         int lv = f->prev->vars[i];
         int rv = f->next->vars[i];
-        int lc = f->combs[i] - (v + lv) + ABS(v - lv);
-        int rc = f->next->combs[i] - (v + rv) + ABS(v - rv);
+        int lc = f->      combs[i] - 2*(v < lv ? v : lv);
+        int rc = f->next->combs[i] - 2*(v < rv ? v : rv);
 
         lc = FFMAX(lc, 0);
         rc = FFMAX(rc, 0);
@@ -676,11 +667,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         goto end;
     }
 
-    av_image_copy(b->planes, s->planewidth,
-                  (const uint8_t**)in->data, in->linesize,
-                  inlink->format, inlink->w, inlink->h);
+    av_image_copy2(b->planes, s->planewidth,
+                   in->data, in->linesize,
+                   inlink->format, inlink->w, inlink->h);
 
-    p = in->interlaced_frame ? !in->top_field_first : 0;
+    p = (in->flags & AV_FRAME_FLAG_INTERLACED) ?
+        !(in->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) : 0;
     pullup_submit_field(s, b, p  );
     pullup_submit_field(s, b, p^1);
 
@@ -723,9 +715,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
     av_frame_copy_props(out, in);
 
-    av_image_copy(out->data, out->linesize,
-                  (const uint8_t**)f->buffer->planes, s->planewidth,
-                  inlink->format, inlink->w, inlink->h);
+    av_image_copy2(out->data, out->linesize,
+                   f->buffer->planes, s->planewidth,
+                   inlink->format, inlink->w, inlink->h);
 
     ret = ff_filter_frame(outlink, out);
     pullup_release_frame(f);
@@ -756,25 +748,15 @@ static const AVFilterPad pullup_inputs[] = {
         .filter_frame = filter_frame,
         .config_props = config_input,
     },
-    { NULL }
 };
 
-static const AVFilterPad pullup_outputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .config_props = config_output,
-    },
-    { NULL }
-};
-
-AVFilter ff_vf_pullup = {
+const AVFilter ff_vf_pullup = {
     .name          = "pullup",
     .description   = NULL_IF_CONFIG_SMALL("Pullup from field sequence to frames."),
     .priv_size     = sizeof(PullupContext),
     .priv_class    = &pullup_class,
     .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = pullup_inputs,
-    .outputs       = pullup_outputs,
+    FILTER_INPUTS(pullup_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

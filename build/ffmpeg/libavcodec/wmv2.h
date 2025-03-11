@@ -21,9 +21,7 @@
 #ifndef AVCODEC_WMV2_H
 #define AVCODEC_WMV2_H
 
-#include "avcodec.h"
 #include "mpegvideo.h"
-#include "intrax8.h"
 #include "wmv2dsp.h"
 
 #define SKIP_TYPE_NONE 0
@@ -32,28 +30,29 @@
 #define SKIP_TYPE_COL  3
 
 
-typedef struct Wmv2Context{
-    MpegEncContext s;
-    IntraX8Context x8;
+typedef struct WMV2Context {
     WMV2DSPContext wdsp;
-    int j_type_bit;
-    int j_type;
-    int abt_flag;
-    int abt_type;
-    int abt_type_table[6];
-    int per_mb_abt;
-    int per_block_abt;
-    int mspel_bit;
-    int cbp_table_index;
-    int top_left_mv_flag;
-    int per_mb_rl_bit;
-    int skip_type;
     int hshift;
+} WMV2Context;
 
-    ScanTable abt_scantable[2];
-    DECLARE_ALIGNED(16, int16_t, abt_block2)[6][64];
-}Wmv2Context;
+void ff_wmv2_common_init(MpegEncContext *s);
 
-void ff_wmv2_common_init(Wmv2Context * w);
+void ff_mspel_motion(MpegEncContext *s,
+                     uint8_t *dest_y, uint8_t *dest_cb, uint8_t *dest_cr,
+                     uint8_t *const *ref_picture,
+                     const op_pixels_func (*pix_op)[4],
+                     int motion_x, int motion_y, int h);
+
+
+static av_always_inline int wmv2_get_cbp_table_index(MpegEncContext *s, int cbp_index)
+{
+    static const uint8_t map[3][3] = {
+        { 0, 2, 1 },
+        { 1, 0, 2 },
+        { 2, 1, 0 },
+    };
+
+    return map[(s->qscale > 10) + (s->qscale > 20)][cbp_index];
+}
 
 #endif /* AVCODEC_WMV2_H */

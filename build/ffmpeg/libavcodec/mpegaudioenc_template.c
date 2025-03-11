@@ -27,7 +27,7 @@
 #include "libavutil/channel_layout.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "encode.h"
 #include "put_bits.h"
 
 #define FRAC_BITS   15   /* fractional bits for sb_samples and dct */
@@ -78,25 +78,21 @@ static av_cold int MPA_encode_init(AVCodecContext *avctx)
     MpegAudioContext *s = avctx->priv_data;
     int freq = avctx->sample_rate;
     int bitrate = avctx->bit_rate;
-    int channels = avctx->channels;
+    int channels = avctx->ch_layout.nb_channels;
     int i, v, table;
     float a;
 
-    if (channels <= 0 || channels > 2){
-        av_log(avctx, AV_LOG_ERROR, "encoding %d channel(s) is not allowed in mp2\n", channels);
-        return AVERROR(EINVAL);
-    }
     bitrate = bitrate / 1000;
     s->nb_channels = channels;
     avctx->frame_size = MPA_FRAME_SIZE;
-    avctx->delay      = 512 - 32 + 1;
+    avctx->initial_padding = 512 - 32 + 1;
 
     /* encoding freq */
     s->lsf = 0;
     for(i=0;i<3;i++) {
-        if (avpriv_mpa_freq_tab[i] == freq)
+        if (ff_mpa_freq_tab[i] == freq)
             break;
-        if ((avpriv_mpa_freq_tab[i] / 2) == freq) {
+        if ((ff_mpa_freq_tab[i] / 2) == freq) {
             s->lsf = 1;
             break;
         }
@@ -109,12 +105,12 @@ static av_cold int MPA_encode_init(AVCodecContext *avctx)
 
     /* encoding bitrate & frequency */
     for(i=1;i<15;i++) {
-        if (avpriv_mpa_bitrate_tab[s->lsf][1][i] == bitrate)
+        if (ff_mpa_bitrate_tab[s->lsf][1][i] == bitrate)
             break;
     }
     if (i == 15 && !avctx->bit_rate) {
         i = 14;
-        bitrate = avpriv_mpa_bitrate_tab[s->lsf][1][i];
+        bitrate = ff_mpa_bitrate_tab[s->lsf][1][i];
         avctx->bit_rate = bitrate * 1000;
     }
     if (i == 15){
@@ -139,7 +135,7 @@ static av_cold int MPA_encode_init(AVCodecContext *avctx)
     s->sblimit = ff_mpa_sblimit_table[table];
     s->alloc_table = ff_mpa_alloc_tables[table];
 
-    av_dlog(avctx, "%d kb/s, %d Hz, frame_size=%d bits, table=%d, padincr=%x\n",
+    ff_dlog(avctx, "%d kb/s, %d Hz, frame_size=%d bits, table=%d, padincr=%x\n",
             bitrate, freq, s->frame_size, table, s->frame_frac_incr);
 
     for(i=0;i<s->nb_channels;i++)
@@ -244,11 +240,11 @@ static void idct32(int *out, int *tab)
     do {
         int x1, x2, x3, x4;
 
-        x3 = MUL(t[16], FIX(SQRT2*0.5));
+        x3 = MUL(t[16], FIX(M_SQRT2*0.5));
         x4 = t[0] - x3;
         x3 = t[0] + x3;
 
-        x2 = MUL(-(t[24] + t[8]), FIX(SQRT2*0.5));
+        x2 = MUL(-(t[24] + t[8]), FIX(M_SQRT2*0.5));
         x1 = MUL((t[8] - x2), xp[0]);
         x2 = MUL((t[8] + x2), xp[1]);
 
@@ -410,7 +406,7 @@ static void compute_scale_factors(MpegAudioContext *s,
                 index = 62; /* value 63 is not allowed */
             }
 
-            av_dlog(NULL, "%2d:%d in=%x %x %d\n",
+            ff_dlog(NULL, "%2d:%d in=%x %x %d\n",
                     j, i, vmax, s->scale_factor_table[index], index);
             /* store the scale factor */
             av_assert2(index >=0 && index <= 63);
@@ -479,7 +475,7 @@ static void compute_scale_factors(MpegAudioContext *s,
             code = 0;           /* kill warning */
         }
 
-        av_dlog(NULL, "%d: %2d %2d %2d %d %d -> %d\n", j,
+        ff_dlog(NULL, "%d: %2d %2d %2d %d %d -> %d\n", j,
                 sf[0], sf[1], sf[2], d1, d2, code);
         scale_code[j] = code;
         sf += 3;
@@ -556,7 +552,7 @@ static void compute_bit_allocation(MpegAudioContext *s,
         }
         if (max_sb < 0)
             break;
-        av_dlog(NULL, "current=%d max=%d max_sb=%d max_ch=%d alloc=%d\n",
+        ff_dlog(NULL, "current=%d max=%d max_sb=%d max_ch=%d alloc=%d\n",
                 current_frame_size, max_frame_size, max_sb, max_ch,
                 bit_alloc[max_ch][max_sb]);
 
@@ -599,7 +595,7 @@ static void compute_bit_allocation(MpegAudioContext *s,
 }
 
 /*
- * Output the mpeg audio layer 2 frame. Note how the code is small
+ * Output the MPEG audio layer 2 frame. Note how the code is small
  * compared to other encoders :-)
  */
 static void encode_frame(MpegAudioContext *s,
@@ -614,7 +610,7 @@ static void encode_frame(MpegAudioContext *s,
     /* header */
 
     put_bits(p, 12, 0xfff);
-    put_bits(p, 1, 1 - s->lsf); /* 1 = mpeg1 ID, 0 = mpeg2 lsf ID */
+    put_bits(p, 1, 1 - s->lsf); /* 1 = MPEG-1 ID, 0 = MPEG-2 lsf ID */
     put_bits(p, 2, 4-2);  /* layer 2 */
     put_bits(p, 1, 1); /* no error protection */
     put_bits(p, 4, s->bitrate_index);
@@ -701,7 +697,7 @@ static void encode_frame(MpegAudioContext *s,
 
                                 /* normalize to P bits */
                                 if (shift < 0)
-                                    q1 = sample << (-shift);
+                                    q1 = sample * (1 << -shift);
                                 else
                                     q1 = sample >> shift;
                                 q1 = (q1 * mult) >> P;
@@ -736,9 +732,6 @@ static void encode_frame(MpegAudioContext *s,
     /* padding */
     for(i=0;i<padding;i++)
         put_bits(p, 1, 0);
-
-    /* flush */
-    flush_put_bits(p);
 }
 
 static int MPA_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
@@ -763,22 +756,25 @@ static int MPA_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     }
     compute_bit_allocation(s, smr, bit_alloc, &padding);
 
-    if ((ret = ff_alloc_packet2(avctx, avpkt, MPA_MAX_CODED_FRAME_SIZE)) < 0)
+    if ((ret = ff_alloc_packet(avctx, avpkt, MPA_MAX_CODED_FRAME_SIZE)) < 0)
         return ret;
 
     init_put_bits(&s->pb, avpkt->data, avpkt->size);
 
     encode_frame(s, bit_alloc, padding);
 
-    if (frame->pts != AV_NOPTS_VALUE)
-        avpkt->pts = frame->pts - ff_samples_to_time_base(avctx, avctx->delay);
+    /* flush */
+    flush_put_bits(&s->pb);
+    avpkt->size = put_bytes_output(&s->pb);
 
-    avpkt->size = put_bits_count(&s->pb) / 8;
+    if (frame->pts != AV_NOPTS_VALUE)
+        avpkt->pts = frame->pts - ff_samples_to_time_base(avctx, avctx->initial_padding);
+
     *got_packet_ptr = 1;
     return 0;
 }
 
-static const AVCodecDefault mp2_defaults[] = {
+static const FFCodecDefault mp2_defaults[] = {
     { "b", "0" },
     { NULL },
 };

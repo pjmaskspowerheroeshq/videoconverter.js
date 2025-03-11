@@ -45,8 +45,7 @@ static int png_parse(AVCodecParserContext *s, AVCodecContext *avctx,
     s->pict_type = AV_PICTURE_TYPE_NONE;
 
     *poutbuf_size = 0;
-    if (buf_size == 0)
-        return 0;
+    *poutbuf = NULL;
 
     if (!ppc->pc.frame_start_found) {
         uint64_t state64 = ppc->pc.state64;
@@ -111,7 +110,7 @@ flush:
     return next;
 }
 
-AVCodecParser ff_png_parser = {
+const AVCodecParser ff_png_parser = {
     .codec_ids      = { AV_CODEC_ID_PNG },
     .priv_data_size = sizeof(PNGParseContext),
     .parser_parse   = png_parse,

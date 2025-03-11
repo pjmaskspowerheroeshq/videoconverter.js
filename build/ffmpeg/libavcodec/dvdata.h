@@ -26,16 +26,10 @@ extern const uint8_t ff_dv_zigzag248_direct[64];
 extern const uint8_t ff_dv_quant_shifts[22][4];
 extern const uint8_t ff_dv_quant_offset[4];
 
-extern const int ff_dv_iweight_88[64];
-extern const int ff_dv_iweight_248[64];
-extern const int ff_dv_iweight_1080_y[64];
-extern const int ff_dv_iweight_1080_c[64];
-extern const int ff_dv_iweight_720_y[64];
-extern const int ff_dv_iweight_720_c[64];
-
 #define NB_DV_VLC 409
+/* The number of entries with value zero in ff_dv_vlc_level. */
+#define NB_DV_ZERO_LEVEL_ENTRIES 72
 
-extern const uint16_t ff_dv_vlc_bits[NB_DV_VLC];
 extern const uint8_t ff_dv_vlc_len[NB_DV_VLC];
 extern const uint8_t ff_dv_vlc_run[NB_DV_VLC];
 extern const uint8_t ff_dv_vlc_level[NB_DV_VLC];

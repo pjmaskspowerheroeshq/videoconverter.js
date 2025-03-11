@@ -27,13 +27,12 @@
  * @remark Development mentored by Benjamin Larson
  */
 
-#include <stddef.h>
-
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/float_dsp.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "qcelpdata.h"
 #include "celp_filters.h"
@@ -50,7 +49,7 @@ typedef enum {
     RATE_FULL
 } qcelp_packet_rate;
 
-typedef struct {
+typedef struct QCELPContext {
     GetBitContext     gb;
     qcelp_packet_rate bitrate;
     QCELPFrame        frame;    /**< unpacked data frame */
@@ -87,8 +86,8 @@ static av_cold int qcelp_decode_init(AVCodecContext *avctx)
     QCELPContext *q = avctx->priv_data;
     int i;
 
-    avctx->channels       = 1;
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_FLT;
 
     for (i = 0; i < 10; i++)
@@ -603,7 +602,7 @@ static qcelp_packet_rate buf_size2bitrate(const int buf_size)
  *
  * @param avctx the AV codec context
  * @param buf_size length of the buffer
- * @param buf the bufffer
+ * @param buf the buffer
  *
  * @return the bitrate on success,
  *         I_F_Q  if the bitrate cannot be satisfactorily determined
@@ -647,8 +646,8 @@ static qcelp_packet_rate determine_bitrate(AVCodecContext *avctx,
 static void warn_insufficient_frame_quality(AVCodecContext *avctx,
                                             const char *message)
 {
-    av_log(avctx, AV_LOG_WARNING, "Frame #%d, IFQ: %s\n",
-           avctx->frame_number, message);
+    av_log(avctx, AV_LOG_WARNING, "Frame #%"PRId64", IFQ: %s\n",
+           avctx->frame_num, message);
 }
 
 static void postfilter(QCELPContext *q, float *samples, float *lpc)
@@ -683,13 +682,12 @@ static void postfilter(QCELPContext *q, float *samples, float *lpc)
                              160, 0.9375, &q->postfilter_agc_mem);
 }
 
-static int qcelp_decode_frame(AVCodecContext *avctx, void *data,
+static int qcelp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                               int *got_frame_ptr, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
     QCELPContext *q    = avctx->priv_data;
-    AVFrame *frame     = data;
     float *outbuffer;
     int   i, ret;
     float quantized_lspf[10], lpc[10];
@@ -719,7 +717,8 @@ static int qcelp_decode_frame(AVCodecContext *avctx, void *data,
                                          qcelp_unpacking_bitmaps_lengths[q->bitrate];
         uint8_t *unpacked_data         = (uint8_t *)&q->frame;
 
-        init_get_bits(&q->gb, buf, 8 * buf_size);
+        if ((ret = init_get_bits8(&q->gb, buf, buf_size)) < 0)
+            return ret;
 
         memset(&q->frame, 0, sizeof(QCELPFrame));
 
@@ -789,13 +788,13 @@ erasure:
     return buf_size;
 }
 
-AVCodec ff_qcelp_decoder = {
-    .name           = "qcelp",
-    .long_name      = NULL_IF_CONFIG_SMALL("QCELP / PureVoice"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_QCELP,
+const FFCodec ff_qcelp_decoder = {
+    .p.name         = "qcelp",
+    CODEC_LONG_NAME("QCELP / PureVoice"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_QCELP,
     .init           = qcelp_decode_init,
-    .decode         = qcelp_decode_frame,
-    .capabilities   = CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(qcelp_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
     .priv_data_size = sizeof(QCELPContext),
 };

@@ -21,7 +21,7 @@
 
 #undef __STRICT_ANSI__ //workaround due to broken kernel headers
 #include "config.h"
-#include "libavformat/internal.h"
+#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -35,17 +35,8 @@
 #endif
 #include <linux/videodev2.h>
 #endif
-#include "libavutil/atomic.h"
-#include "libavutil/avassert.h"
-#include "libavutil/imgutils.h"
-#include "libavutil/log.h"
-#include "libavutil/opt.h"
-#include "avdevice.h"
-#include "timefilter.h"
-#include "libavutil/parseutils.h"
-#include "libavutil/pixdesc.h"
-#include "libavutil/time.h"
-#include "libavutil/avstring.h"
+#include "libavutil/pixfmt.h"
+#include "libavcodec/codec_id.h"
 
 struct fmt_map {
     enum AVPixelFormat ff_fmt;
@@ -53,10 +44,10 @@ struct fmt_map {
     uint32_t v4l2_fmt;
 };
 
-extern av_export const struct fmt_map avpriv_fmt_conversion_table[];
+extern const struct fmt_map ff_fmt_conversion_table[];
 
-uint32_t avpriv_fmt_ff2v4l(enum AVPixelFormat pix_fmt, enum AVCodecID codec_id);
-enum AVPixelFormat avpriv_fmt_v4l2ff(uint32_t v4l2_fmt, enum AVCodecID codec_id);
-enum AVCodecID avpriv_fmt_v4l2codec(uint32_t v4l2_fmt);
+uint32_t ff_fmt_ff2v4l(enum AVPixelFormat pix_fmt, enum AVCodecID codec_id);
+enum AVPixelFormat ff_fmt_v4l2ff(uint32_t v4l2_fmt, enum AVCodecID codec_id);
+enum AVCodecID ff_fmt_v4l2codec(uint32_t v4l2_fmt);
 
 #endif /* AVDEVICE_V4L2_COMMON_H */

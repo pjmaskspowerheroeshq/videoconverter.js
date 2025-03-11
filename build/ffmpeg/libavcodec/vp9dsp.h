@@ -27,11 +27,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "vp9.h"
+#include "libavcodec/vp9.h"
+#include "libavutil/attributes_internal.h"
 
 typedef void (*vp9_mc_func)(uint8_t *dst, ptrdiff_t dst_stride,
                             const uint8_t *ref, ptrdiff_t ref_stride,
                             int h, int mx, int my);
+typedef void (*vp9_scaled_mc_func)(uint8_t *dst, ptrdiff_t dst_stride,
+                                   const uint8_t *ref, ptrdiff_t ref_stride,
+                                   int h, int mx, int my, int dx, int dy);
 
 typedef struct VP9DSPContext {
     /*
@@ -44,7 +48,7 @@ typedef struct VP9DSPContext {
      */
     // FIXME(rbultje) maybe replace left/top pointers with HAVE_TOP/
     // HAVE_LEFT/HAVE_TOPRIGHT flags instead, and then handle it in-place?
-    // also needs to fit in with what h264/vp8/etc do
+    // also needs to fit in with what H.264/VP8/etc do
     void (*intra_pred[N_TXFM_SIZES][N_INTRA_PRED_MODES])(uint8_t *dst,
                                                          ptrdiff_t stride,
                                                          const uint8_t *left,
@@ -108,11 +112,28 @@ typedef struct VP9DSPContext {
      *
      * dst/stride are aligned by hsize
      */
-    vp9_mc_func mc[5][4][2][2][2];
+    vp9_mc_func mc[5][N_FILTERS][2][2][2];
+
+    /*
+     * for scalable MC, first 3 dimensions identical to above, the other two
+     * don't exist since it changes per stepsize.
+     */
+    vp9_scaled_mc_func smc[5][N_FILTERS][2];
 } VP9DSPContext;
 
-void ff_vp9dsp_init(VP9DSPContext *dsp);
+extern const int16_t attribute_visibility_hidden ff_vp9_subpel_filters[3][16][8];
 
-void ff_vp9dsp_init_x86(VP9DSPContext *dsp);
+void ff_vp9dsp_init(VP9DSPContext *dsp, int bpp, int bitexact);
+
+void ff_vp9dsp_init_8(VP9DSPContext *dsp);
+void ff_vp9dsp_init_10(VP9DSPContext *dsp);
+void ff_vp9dsp_init_12(VP9DSPContext *dsp);
+
+void ff_vp9dsp_init_aarch64(VP9DSPContext *dsp, int bpp);
+void ff_vp9dsp_init_arm(VP9DSPContext *dsp, int bpp);
+void ff_vp9dsp_init_riscv(VP9DSPContext *dsp, int bpp, int bitexact);
+void ff_vp9dsp_init_x86(VP9DSPContext *dsp, int bpp, int bitexact);
+void ff_vp9dsp_init_mips(VP9DSPContext *dsp, int bpp);
+void ff_vp9dsp_init_loongarch(VP9DSPContext *dsp, int bpp);
 
 #endif /* AVCODEC_VP9DSP_H */

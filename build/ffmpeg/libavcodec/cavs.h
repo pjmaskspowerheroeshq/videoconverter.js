@@ -22,10 +22,16 @@
 #ifndef AVCODEC_CAVS_H
 #define AVCODEC_CAVS_H
 
+#include <stddef.h>
+#include <stdint.h>
+
+#include "libavutil/frame.h"
+#include "libavutil/mem_internal.h"
+
+#include "avcodec.h"
 #include "cavsdsp.h"
 #include "blockdsp.h"
 #include "h264chroma.h"
-#include "idctdsp.h"
 #include "get_bits.h"
 #include "videodsp.h"
 
@@ -164,7 +170,6 @@ typedef struct AVSContext {
     AVCodecContext *avctx;
     BlockDSPContext bdsp;
     H264ChromaContext h264chroma;
-    IDCTDSPContext idsp;
     VideoDSPContext vdsp;
     CAVSDSPContext  cdsp;
     GetBitContext gb;
@@ -218,7 +223,7 @@ typedef struct AVSContext {
     int qp_fixed;
     int pic_qp_fixed;
     int cbp;
-    ScanTable scantable;
+    uint8_t permutated_scantable[64];
 
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */
@@ -227,8 +232,8 @@ typedef struct AVSContext {
     uint8_t intern_border_y[26];
     uint8_t topleft_border_y, topleft_border_u, topleft_border_v;
 
-    void (*intra_pred_l[8])(uint8_t *d,uint8_t *top,uint8_t *left,int stride);
-    void (*intra_pred_c[7])(uint8_t *d,uint8_t *top,uint8_t *left,int stride);
+    void (*intra_pred_l[8])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
+    void (*intra_pred_c[7])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
     uint8_t *col_type_base;
 
     /* scaling factors for MV prediction */
@@ -272,7 +277,7 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
 void ff_cavs_init_mb(AVSContext *h);
 int  ff_cavs_next_mb(AVSContext *h);
 int ff_cavs_init_pic(AVSContext *h);
-void ff_cavs_init_top_lines(AVSContext *h);
+int ff_cavs_init_top_lines(AVSContext *h);
 int ff_cavs_init(AVCodecContext *avctx);
 int ff_cavs_end (AVCodecContext *avctx);
 

@@ -24,12 +24,16 @@
  * a64 video encoder - multicolor modes
  */
 
+#include "config_components.h"
+
 #include "a64colors.h"
 #include "a64tables.h"
+#include "codec_internal.h"
 #include "elbg.h"
-#include "internal.h"
-#include "libavutil/common.h"
+#include "encode.h"
+#include "libavutil/avassert.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 
 #define DITHERSTEPS   8
 #define CHARSET_CHARS 256
@@ -41,6 +45,7 @@
 
 typedef struct A64Context {
     /* variables for multicolor modes */
+    struct ELBGContext *elbg;
     AVLFG randctx;
     int mc_lifetime;
     int mc_use_5col;
@@ -49,7 +54,6 @@ typedef struct A64Context {
     int *mc_charmap;
     int *mc_best_cb;
     int mc_luma_vals[5];
-    uint8_t *mc_charset;
     uint8_t *mc_colram;
     uint8_t *mc_palette;
     int mc_pal_size;
@@ -59,28 +63,33 @@ typedef struct A64Context {
 } A64Context;
 
 /* gray gradient */
-static const int mc_colors[5]={0x0,0xb,0xc,0xf,0x1};
+static const uint8_t mc_colors[5]={0x0,0xb,0xc,0xf,0x1};
 
 /* other possible gradients - to be tested */
-//static const int mc_colors[5]={0x0,0x8,0xa,0xf,0x7};
-//static const int mc_colors[5]={0x0,0x9,0x8,0xa,0x3};
+//static const uint8_t mc_colors[5]={0x0,0x8,0xa,0xf,0x7};
+//static const uint8_t mc_colors[5]={0x0,0x9,0x8,0xa,0x3};
 
-static void to_meta_with_crop(AVCodecContext *avctx, AVFrame *p, int *dest)
+static void to_meta_with_crop(AVCodecContext *avctx,
+                              const AVFrame *p, int *dest)
 {
     int blockx, blocky, x, y;
     int luma = 0;
     int height = FFMIN(avctx->height, C64YRES);
     int width  = FFMIN(avctx->width , C64XRES);
-    uint8_t *src = p->data[0];
+    const uint8_t *src = p->data[0];
 
     for (blocky = 0; blocky < C64YRES; blocky += 8) {
         for (blockx = 0; blockx < C64XRES; blockx += 8) {
             for (y = blocky; y < blocky + 8 && y < C64YRES; y++) {
                 for (x = blockx; x < blockx + 8 && x < C64XRES; x += 2) {
                     if(x < width && y < height) {
-                        /* build average over 2 pixels */
-                        luma = (src[(x + 0 + y * p->linesize[0])] +
-                                src[(x + 1 + y * p->linesize[0])]) / 2;
+                        if (x + 1 < width) {
+                            /* build average over 2 pixels */
+                            luma = (src[(x + 0 + y * p->linesize[0])] +
+                                    src[(x + 1 + y * p->linesize[0])]) / 2;
+                        } else {
+                            luma = src[(x + y * p->linesize[0])];
+                        }
                         /* write blocks as linear data now so they are suitable for elbg */
                         dest[0] = luma;
                     }
@@ -101,13 +110,16 @@ static void render_charset(AVCodecContext *avctx, uint8_t *charset,
     uint8_t pix;
     int lowdiff, highdiff;
     int *best_cb = c->mc_best_cb;
-    static uint8_t index1[256];
-    static uint8_t index2[256];
-    static uint8_t dither[256];
+    uint8_t index1[256];
+    uint8_t index2[256];
+    uint8_t dither[256];
     int i;
     int distance;
 
-    /* generate lookup-tables for dither and index before looping */
+    /* Generate lookup-tables for dither and index before looping.
+     * This code relies on c->mc_luma_vals[c->mc_pal_size - 1] being
+     * the maximum of all the mc_luma_vals values and on the minimum
+     * being zero; this ensures that dither is properly initialized. */
     i = 0;
     for (a=0; a < 256; a++) {
         if(i < c->mc_pal_size -1 && a == c->mc_luma_vals[i + 1]) {
@@ -186,12 +198,13 @@ static void render_charset(AVCodecContext *avctx, uint8_t *charset,
 static av_cold int a64multi_close_encoder(AVCodecContext *avctx)
 {
     A64Context *c = avctx->priv_data;
-    av_frame_free(&avctx->coded_frame);
-    av_free(c->mc_meta_charset);
-    av_free(c->mc_best_cb);
-    av_free(c->mc_charset);
-    av_free(c->mc_charmap);
-    av_free(c->mc_colram);
+
+    avpriv_elbg_free(&c->elbg);
+
+    av_freep(&c->mc_meta_charset);
+    av_freep(&c->mc_best_cb);
+    av_freep(&c->mc_charmap);
+    av_freep(&c->mc_colram);
     return 0;
 }
 
@@ -204,7 +217,7 @@ static av_cold int a64multi_encode_init(AVCodecContext *avctx)
     if (avctx->global_quality < 1) {
         c->mc_lifetime = 4;
     } else {
-        c->mc_lifetime = avctx->global_quality /= FF_QP2LAMBDA;
+        c->mc_lifetime = avctx->global_quality / FF_QP2LAMBDA;
     }
 
     av_log(avctx, AV_LOG_INFO, "charset lifetime set to %d frame(s)\n", c->mc_lifetime);
@@ -220,17 +233,16 @@ static av_cold int a64multi_encode_init(AVCodecContext *avctx)
                            a64_palette[mc_colors[a]][2] * 0.11;
     }
 
-    if (!(c->mc_meta_charset = av_malloc_array(c->mc_lifetime, 32000 * sizeof(int))) ||
+    if (!(c->mc_meta_charset = av_calloc(c->mc_lifetime, 32000 * sizeof(int))) ||
        !(c->mc_best_cb       = av_malloc(CHARSET_CHARS * 32 * sizeof(int)))     ||
-       !(c->mc_charmap       = av_mallocz_array(c->mc_lifetime, 1000 * sizeof(int))) ||
-       !(c->mc_colram        = av_mallocz(CHARSET_CHARS * sizeof(uint8_t)))     ||
-       !(c->mc_charset       = av_malloc(0x800 * (INTERLACED+1) * sizeof(uint8_t)))) {
+       !(c->mc_charmap       = av_calloc(c->mc_lifetime, 1000 * sizeof(int))) ||
+       !(c->mc_colram        = av_mallocz(CHARSET_CHARS * sizeof(uint8_t)))) {
         av_log(avctx, AV_LOG_ERROR, "Failed to allocate buffer memory.\n");
         return AVERROR(ENOMEM);
     }
 
     /* set up extradata */
-    if (!(avctx->extradata = av_mallocz(8 * 4 + FF_INPUT_BUFFER_PADDING_SIZE))) {
+    if (!(avctx->extradata = av_mallocz(8 * 4 + AV_INPUT_BUFFER_PADDING_SIZE))) {
         av_log(avctx, AV_LOG_ERROR, "Failed to allocate memory for extradata.\n");
         return AVERROR(ENOMEM);
     }
@@ -238,14 +250,6 @@ static av_cold int a64multi_encode_init(AVCodecContext *avctx)
     AV_WB32(avctx->extradata, c->mc_lifetime);
     AV_WB32(avctx->extradata + 16, INTERLACED);
 
-    avctx->coded_frame = av_frame_alloc();
-    if (!avctx->coded_frame) {
-        a64multi_close_encoder(avctx);
-        return AVERROR(ENOMEM);
-    }
-
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-    avctx->coded_frame->key_frame = 1;
     if (!avctx->codec_tag)
          avctx->codec_tag = AV_RL32("a64m");
 
@@ -270,10 +274,9 @@ static void a64_compress_colram(unsigned char *buf, int *charmap, uint8_t *colra
 }
 
 static int a64multi_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
-                                 const AVFrame *pict, int *got_packet)
+                                 const AVFrame *p, int *got_packet)
 {
     A64Context *c = avctx->priv_data;
-    AVFrame *const p = avctx->coded_frame;
 
     int frame;
     int x, y;
@@ -285,7 +288,6 @@ static int a64multi_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     int *charmap     = c->mc_charmap;
     uint8_t *colram  = c->mc_colram;
-    uint8_t *charset = c->mc_charset;
     int *meta        = c->mc_meta_charset;
     int *best_cb     = c->mc_best_cb;
 
@@ -304,7 +306,7 @@ static int a64multi_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     /* no data, means end encoding asap */
-    if (!pict) {
+    if (!p) {
         /* all done, end encoding */
         if (!c->mc_lifetime) return 0;
         /* no more frames in queue, prepare to flush remaining frames */
@@ -317,13 +319,10 @@ static int a64multi_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     } else {
         /* fill up mc_meta_charset with data until lifetime exceeds */
         if (c->mc_frame_counter < c->mc_lifetime) {
-            *p = *pict;
-            p->pict_type = AV_PICTURE_TYPE_I;
-            p->key_frame = 1;
             to_meta_with_crop(avctx, p, meta + 32000 * c->mc_frame_counter);
             c->mc_frame_counter++;
             if (c->next_pts == AV_NOPTS_VALUE)
-                c->next_pts = pict->pts;
+                c->next_pts = p->pts;
             /* lifetime is not reached so wait for next frame first */
             return 0;
         }
@@ -334,24 +333,23 @@ static int a64multi_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         req_size = 0;
         /* any frames to encode? */
         if (c->mc_lifetime) {
-            req_size = charset_size + c->mc_lifetime*(screen_size + colram_size);
-            if ((ret = ff_alloc_packet2(avctx, pkt, req_size)) < 0)
+            int alloc_size = charset_size + c->mc_lifetime*(screen_size + colram_size);
+            if ((ret = ff_get_encode_buffer(avctx, pkt, alloc_size, 0)) < 0)
                 return ret;
             buf = pkt->data;
 
             /* calc optimal new charset + charmaps */
-            avpriv_init_elbg(meta, 32, 1000 * c->mc_lifetime, best_cb, CHARSET_CHARS, 50, charmap, &c->randctx);
-            avpriv_do_elbg  (meta, 32, 1000 * c->mc_lifetime, best_cb, CHARSET_CHARS, 50, charmap, &c->randctx);
+            ret = avpriv_elbg_do(&c->elbg, meta, 32, 1000 * c->mc_lifetime,
+                                 best_cb, CHARSET_CHARS, 50, charmap, &c->randctx, 0);
+            if (ret < 0)
+                return ret;
 
             /* create colorram map and a c64 readable charset */
-            render_charset(avctx, charset, colram);
-
-            /* copy charset to buf */
-            memcpy(buf, charset, charset_size);
+            render_charset(avctx, buf, colram);
 
             /* advance pointers */
             buf      += charset_size;
-            charset  += charset_size;
+            req_size += charset_size;
         }
 
         /* write x frames to buf */
@@ -388,38 +386,39 @@ static int a64multi_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         pkt->pts = pkt->dts = c->next_pts;
         c->next_pts         = AV_NOPTS_VALUE;
 
-        pkt->size   = req_size;
-        pkt->flags |= AV_PKT_FLAG_KEY;
+        av_assert0(pkt->size == req_size);
         *got_packet = !!req_size;
     }
     return 0;
 }
 
 #if CONFIG_A64MULTI_ENCODER
-AVCodec ff_a64multi_encoder = {
-    .name           = "a64multi",
-    .long_name      = NULL_IF_CONFIG_SMALL("Multicolor charset for Commodore 64"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_A64_MULTI,
+const FFCodec ff_a64multi_encoder = {
+    .p.name         = "a64multi",
+    CODEC_LONG_NAME("Multicolor charset for Commodore 64"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_A64_MULTI,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     .priv_data_size = sizeof(A64Context),
     .init           = a64multi_encode_init,
-    .encode2        = a64multi_encode_frame,
+    FF_CODEC_ENCODE_CB(a64multi_encode_frame),
     .close          = a64multi_close_encoder,
-    .pix_fmts       = (const enum AVPixelFormat[]) {AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE},
-    .capabilities   = CODEC_CAP_DELAY,
+    .p.pix_fmts     = (const enum AVPixelFormat[]) {AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE},
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
 #endif
 #if CONFIG_A64MULTI5_ENCODER
-AVCodec ff_a64multi5_encoder = {
-    .name           = "a64multi5",
-    .long_name      = NULL_IF_CONFIG_SMALL("Multicolor charset for Commodore 64, extended with 5th color (colram)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_A64_MULTI5,
+const FFCodec ff_a64multi5_encoder = {
+    .p.name         = "a64multi5",
+    CODEC_LONG_NAME("Multicolor charset for Commodore 64, extended with 5th color (colram)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_A64_MULTI5,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     .priv_data_size = sizeof(A64Context),
     .init           = a64multi_encode_init,
-    .encode2        = a64multi_encode_frame,
+    FF_CODEC_ENCODE_CB(a64multi_encode_frame),
     .close          = a64multi_close_encoder,
-    .pix_fmts       = (const enum AVPixelFormat[]) {AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE},
-    .capabilities   = CODEC_CAP_DELAY,
+    .p.pix_fmts     = (const enum AVPixelFormat[]) {AV_PIX_FMT_GRAY8, AV_PIX_FMT_NONE},
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
 #endif

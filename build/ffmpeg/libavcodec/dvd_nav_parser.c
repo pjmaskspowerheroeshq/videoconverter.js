@@ -19,7 +19,6 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "avcodec.h"
-#include "dsputil.h"
 #include "get_bits.h"
 #include "parser.h"
 
@@ -108,7 +107,7 @@ static int dvd_nav_parse(AVCodecParserContext *s,
     return buf_size;
 }
 
-AVCodecParser ff_dvd_nav_parser = {
+const AVCodecParser ff_dvd_nav_parser = {
     .codec_ids      = { AV_CODEC_ID_DVD_NAV },
     .priv_data_size = sizeof(DVDNavParseContext),
     .parser_init    = dvd_nav_parse_init,

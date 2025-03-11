@@ -18,10 +18,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "vidstabutils.h"
 
+const enum AVPixelFormat ff_vidstab_pix_fmts[] =  {
+    AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUVA420P,
+    AV_PIX_FMT_YUV440P,  AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_RGB24,    AV_PIX_FMT_BGR24,   AV_PIX_FMT_RGBA,
+    AV_PIX_FMT_NONE
+};
+
 /** convert AV's pixelformat to vid.stab pixelformat */
-VSPixelFormat av_2_vs_pixel_format(AVFilterContext *ctx, enum AVPixelFormat pf)
+VSPixelFormat ff_av2vs_pixfmt(AVFilterContext *ctx, enum AVPixelFormat pf)
 {
     switch (pf) {
     case AV_PIX_FMT_YUV420P:  return PF_YUV420P;
@@ -42,21 +51,21 @@ VSPixelFormat av_2_vs_pixel_format(AVFilterContext *ctx, enum AVPixelFormat pf)
 }
 
 /** struct to hold a valid context for logging from within vid.stab lib */
-typedef struct {
+typedef struct VS2AVLogCtx {
     const AVClass *class;
 } VS2AVLogCtx;
 
 /** wrapper to log vs_log into av_log */
-static int vs_2_av_log_wrapper(int type, const char *tag, const char *format, ...)
+static int vs2av_log(int type, const char *tag, const char *format, ...)
 {
     va_list ap;
     VS2AVLogCtx ctx;
     AVClass class = {
-      .class_name = tag,
-      .item_name  = av_default_item_name,
-      .option     = 0,
-      .version    = LIBAVUTIL_VERSION_INT,
-      .category   = AV_CLASS_CATEGORY_FILTER,
+        .class_name = tag,
+        .item_name  = av_default_item_name,
+        .option     = 0,
+        .version    = LIBAVUTIL_VERSION_INT,
+        .category   = AV_CLASS_CATEGORY_FILTER,
     };
     ctx.class = &class;
     va_start(ap, format);
@@ -66,7 +75,7 @@ static int vs_2_av_log_wrapper(int type, const char *tag, const char *format, ..
 }
 
 /** sets the memory allocation function and logging constants to av versions */
-void vs_set_mem_and_log_functions(void)
+void ff_vs_init(void)
 {
     vs_malloc  = av_malloc;
     vs_zalloc  = av_mallocz;
@@ -78,7 +87,7 @@ void vs_set_mem_and_log_functions(void)
     VS_INFO_TYPE  = AV_LOG_INFO;
     VS_MSG_TYPE   = AV_LOG_VERBOSE;
 
-    vs_log   = vs_2_av_log_wrapper;
+    vs_log   = vs2av_log;
 
     VS_ERROR = 0;
     VS_OK    = 1;

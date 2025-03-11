@@ -26,24 +26,26 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
-#include "libavutil/bswap.h"
 #include "libavutil/dict.h"
+#include "libavutil/mem.h"
+
 #include "libavcodec/bytestream.h"
-#include "libavcodec/get_bits.h"
 #include "libavcodec/vorbis_parser.h"
+
 #include "avformat.h"
+#include "demux.h"
 #include "flac_picture.h"
 #include "internal.h"
 #include "oggdec.h"
 #include "vorbiscomment.h"
 #include "replaygain.h"
 
-static int ogm_chapter(AVFormatContext *as, uint8_t *key, uint8_t *val)
+static int ogm_chapter(AVFormatContext *as, const uint8_t *key, const uint8_t *val)
 {
     int i, cnum, h, m, s, ms, keylen = strlen(key);
     AVChapter *chapter = NULL;
 
-    if (keylen < 9 || sscanf(key, "CHAPTER%03d", &cnum) != 1)
+    if (keylen < 9 || av_strncasecmp(key, "CHAPTER", 7) || sscanf(key+7, "%03d", &cnum) != 1)
         return 0;
 
     if (keylen <= 10) {
@@ -53,8 +55,7 @@ static int ogm_chapter(AVFormatContext *as, uint8_t *key, uint8_t *val)
         avpriv_new_chapter(as, cnum, (AVRational) { 1, 1000 },
                            ms + 1000 * (s + 60 * (m + 60 * h)),
                            AV_NOPTS_VALUE, NULL);
-        av_free(val);
-    } else if (!strcmp(key + keylen - 4, "NAME")) {
+    } else if (!av_strcasecmp(key + keylen - 4, "NAME")) {
         for (i = 0; i < as->nb_chapters; i++)
             if (as->chapters[i]->id == cnum) {
                 chapter = as->chapters[i];
@@ -63,12 +64,86 @@ static int ogm_chapter(AVFormatContext *as, uint8_t *key, uint8_t *val)
         if (!chapter)
             return 0;
 
-        av_dict_set(&chapter->metadata, "title", val, AV_DICT_DONT_STRDUP_VAL);
+        av_dict_set(&chapter->metadata, "title", val, 0);
     } else
         return 0;
 
-    av_free(key);
     return 1;
+}
+
+int ff_vorbis_stream_comment(AVFormatContext *as, AVStream *st,
+                             const uint8_t *buf, int size)
+{
+    int updates = ff_vorbis_comment(as, &st->metadata, buf, size, 1);
+
+    if (updates > 0) {
+        st->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+    }
+
+    return updates;
+}
+
+/**
+ * This function temporarily modifies the (const qualified) input buffer
+ * and reverts its changes before return. The input buffer needs to have
+ * at least one byte of padding.
+ */
+static int vorbis_parse_single_comment(AVFormatContext *as, AVDictionary **m,
+                                       const uint8_t *buf, uint32_t size,
+                                       int *updates, int parse_picture)
+{
+    char *t = (char*)buf, *v = memchr(t, '=', size);
+    int tl, vl;
+    char backup;
+
+    if (!v)
+        return 0;
+
+    tl = v - t;
+    vl = size - tl - 1;
+    v++;
+
+    if (!tl || !vl)
+        return 0;
+
+    t[tl]  = 0;
+
+    backup = v[vl];
+    v[vl]  = 0;
+
+    /* The format in which the pictures are stored is the FLAC format.
+     * Xiph says: "The binary FLAC picture structure is base64 encoded
+     * and placed within a VorbisComment with the tag name
+     * 'METADATA_BLOCK_PICTURE'. This is the preferred and
+     * recommended way of embedding cover art within VorbisComments."
+     */
+    if (!av_strcasecmp(t, "METADATA_BLOCK_PICTURE") && parse_picture) {
+        int ret, len = AV_BASE64_DECODE_SIZE(vl);
+        uint8_t *pict = av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE);
+
+        if (!pict) {
+            av_log(as, AV_LOG_WARNING, "out-of-memory error. Skipping cover art block.\n");
+            goto end;
+        }
+        ret = av_base64_decode(pict, v, len);
+        if (ret > 0)
+            ret = ff_flac_parse_picture(as, &pict, ret, 0);
+        av_freep(&pict);
+        if (ret < 0) {
+            av_log(as, AV_LOG_WARNING, "Failed to parse cover art block.\n");
+            goto end;
+        }
+    } else if (!ogm_chapter(as, t, v)) {
+        (*updates)++;
+        if (av_dict_get(*m, t, NULL, 0))
+            av_dict_set(m, t, ";", AV_DICT_APPEND);
+        av_dict_set(m, t, v, AV_DICT_APPEND);
+    }
+end:
+    t[tl] = '=';
+    v[vl] = backup;
+
+    return 0;
 }
 
 int ff_vorbis_comment(AVFormatContext *as, AVDictionary **m,
@@ -77,8 +152,9 @@ int ff_vorbis_comment(AVFormatContext *as, AVDictionary **m,
 {
     const uint8_t *p   = buf;
     const uint8_t *end = buf + size;
-    unsigned n, j;
-    int s;
+    int updates        = 0;
+    unsigned n;
+    int s, ret;
 
     /* must have vendor_length and user_comment_list_length */
     if (size < 8)
@@ -94,79 +170,16 @@ int ff_vorbis_comment(AVFormatContext *as, AVDictionary **m,
     n = bytestream_get_le32(&p);
 
     while (end - p >= 4 && n > 0) {
-        const char *t, *v;
-        int tl, vl;
-
         s = bytestream_get_le32(&p);
 
         if (end - p < s || s < 0)
             break;
 
-        t  = p;
+        ret = vorbis_parse_single_comment(as, m, p, s, &updates, parse_picture);
+        if (ret < 0)
+            return ret;
         p += s;
         n--;
-
-        v = memchr(t, '=', s);
-        if (!v)
-            continue;
-
-        tl = v - t;
-        vl = s - tl - 1;
-        v++;
-
-        if (tl && vl) {
-            char *tt, *ct;
-
-            tt = av_malloc(tl + 1);
-            ct = av_malloc(vl + 1);
-            if (!tt || !ct) {
-                av_freep(&tt);
-                av_freep(&ct);
-                return AVERROR(ENOMEM);
-            }
-
-            for (j = 0; j < tl; j++)
-                tt[j] = av_toupper(t[j]);
-            tt[tl] = 0;
-
-            memcpy(ct, v, vl);
-            ct[vl] = 0;
-
-            /* The format in which the pictures are stored is the FLAC format.
-             * Xiph says: "The binary FLAC picture structure is base64 encoded
-             * and placed within a VorbisComment with the tag name
-             * 'METADATA_BLOCK_PICTURE'. This is the preferred and
-             * recommended way of embedding cover art within VorbisComments."
-             */
-            if (!strcmp(tt, "METADATA_BLOCK_PICTURE") && parse_picture) {
-                int ret;
-                char *pict = av_malloc(vl);
-
-                if (!pict) {
-                    av_log(as, AV_LOG_WARNING, "out-of-memory error. Skipping cover art block.\n");
-                    av_freep(&tt);
-                    av_freep(&ct);
-                    continue;
-                }
-                if ((ret = av_base64_decode(pict, ct, vl)) > 0)
-                    ret = ff_flac_parse_picture(as, pict, ret);
-                av_freep(&tt);
-                av_freep(&ct);
-                av_freep(&pict);
-                if (ret < 0) {
-                    av_log(as, AV_LOG_WARNING, "Failed to parse cover art block.\n");
-                    continue;
-                }
-            } else if (!ogm_chapter(as, tt, ct)) {
-                if (av_dict_get(*m, tt, NULL, 0)) {
-                    av_dict_set(m, tt, ";", AV_DICT_APPEND);
-                }
-                av_dict_set(m, tt, ct,
-                            AV_DICT_DONT_STRDUP_KEY |
-                            AV_DICT_APPEND);
-                av_freep(&ct);
-            }
-        }
     }
 
     if (p != end)
@@ -178,7 +191,7 @@ int ff_vorbis_comment(AVFormatContext *as, AVDictionary **m,
 
     ff_metadata_conv(m, NULL, ff_vorbiscomment_metadata_conv);
 
-    return 0;
+    return updates;
 }
 
 /*
@@ -199,7 +212,7 @@ int ff_vorbis_comment(AVFormatContext *as, AVDictionary **m,
 struct oggvorbis_private {
     unsigned int len[3];
     unsigned char *packet[3];
-    VorbisParseContext vp;
+    AVVorbisParseContext *vp;
     int64_t final_pts;
     int final_duration;
 };
@@ -214,6 +227,10 @@ static int fixup_vorbis_headers(AVFormatContext *as,
 
     len = priv->len[0] + priv->len[1] + priv->len[2];
     buf_len = len + len / 255 + 64;
+
+    if (*buf)
+        return AVERROR_INVALIDDATA;
+
     ptr = *buf = av_realloc(NULL, buf_len);
     if (!ptr)
         return AVERROR(ENOMEM);
@@ -228,7 +245,7 @@ static int fixup_vorbis_headers(AVFormatContext *as,
         offset += priv->len[i];
         av_freep(&priv->packet[i]);
     }
-    if ((err = av_reallocp(buf, offset + FF_INPUT_BUFFER_PADDING_SIZE)) < 0)
+    if ((err = av_reallocp(buf, offset + AV_INPUT_BUFFER_PADDING_SIZE)) < 0)
         return err;
     return offset;
 }
@@ -239,9 +256,11 @@ static void vorbis_cleanup(AVFormatContext *s, int idx)
     struct ogg_stream *os = ogg->streams + idx;
     struct oggvorbis_private *priv = os->private;
     int i;
-    if (os->private)
+    if (os->private) {
+        av_vorbis_parse_free(&priv->vp);
         for (i = 0; i < 3; i++)
             av_freep(&priv->packet[i]);
+    }
 }
 
 static int vorbis_update_metadata(AVFormatContext *s, int idx)
@@ -256,8 +275,8 @@ static int vorbis_update_metadata(AVFormatContext *s, int idx)
 
     /* New metadata packet; release old data. */
     av_dict_free(&st->metadata);
-    ret = ff_vorbis_comment(s, &st->metadata, os->buf + os->pstart + 7,
-                            os->psize - 8, 1);
+    ret = ff_vorbis_stream_comment(s, st, os->buf + os->pstart + 7,
+                                   os->psize - 8);
     if (ret < 0)
         return ret;
 
@@ -267,7 +286,7 @@ static int vorbis_update_metadata(AVFormatContext *s, int idx)
         os->new_metadata = av_packet_pack_dictionary(st->metadata, &os->new_metadata_size);
     /* Send an empty dictionary to indicate that metadata has been cleared. */
     } else {
-        os->new_metadata = av_malloc(1);
+        os->new_metadata = av_mallocz(1);
         os->new_metadata_size = 0;
     }
 
@@ -288,24 +307,28 @@ static int vorbis_header(AVFormatContext *s, int idx)
             return AVERROR(ENOMEM);
     }
 
-    if (!(pkt_type & 1))
-        return 0;
-
-    if (os->psize < 1 || pkt_type > 5)
-        return AVERROR_INVALIDDATA;
-
     priv = os->private;
+
+    if (!(pkt_type & 1))
+        return priv->vp ? 0 : AVERROR_INVALIDDATA;
+
+    if (pkt_type > 5) {
+        av_log(s, AV_LOG_VERBOSE, "Ignoring packet with unknown type %d\n", pkt_type);
+        return 1;
+    }
+
+    if (os->psize < 1)
+        return AVERROR_INVALIDDATA;
 
     if (priv->packet[pkt_type >> 1])
         return AVERROR_INVALIDDATA;
     if (pkt_type > 1 && !priv->packet[0] || pkt_type > 3 && !priv->packet[1])
-        return AVERROR_INVALIDDATA;
+        return priv->vp ? 0 : AVERROR_INVALIDDATA;
 
     priv->len[pkt_type >> 1]    = os->psize;
-    priv->packet[pkt_type >> 1] = av_mallocz(os->psize);
+    priv->packet[pkt_type >> 1] = av_memdup(os->buf + os->pstart, os->psize);
     if (!priv->packet[pkt_type >> 1])
         return AVERROR(ENOMEM);
-    memcpy(priv->packet[pkt_type >> 1], os->buf + os->pstart, os->psize);
     if (os->buf[os->pstart] == 1) {
         const uint8_t *p = os->buf + os->pstart + 7; /* skip "\001vorbis" tag */
         unsigned blocksize, bs0, bs1;
@@ -319,14 +342,15 @@ static int vorbis_header(AVFormatContext *s, int idx)
             return AVERROR_INVALIDDATA;
 
         channels = bytestream_get_byte(&p);
-        if (st->codec->channels && channels != st->codec->channels) {
+        if (st->codecpar->ch_layout.nb_channels &&
+            channels != st->codecpar->ch_layout.nb_channels) {
             av_log(s, AV_LOG_ERROR, "Channel change is not supported\n");
             return AVERROR_PATCHWELCOME;
         }
-        st->codec->channels = channels;
+        st->codecpar->ch_layout.nb_channels = channels;
         srate               = bytestream_get_le32(&p);
         p += 4; // skip maximum bitrate
-        st->codec->bit_rate = bytestream_get_le32(&p); // nominal bitrate
+        st->codecpar->bit_rate = bytestream_get_le32(&p); // nominal bitrate
         p += 4; // skip minimum bitrate
 
         blocksize = bytestream_get_byte(&p);
@@ -341,11 +365,11 @@ static int vorbis_header(AVFormatContext *s, int idx)
         if (bytestream_get_byte(&p) != 1) /* framing_flag */
             return AVERROR_INVALIDDATA;
 
-        st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-        st->codec->codec_id   = AV_CODEC_ID_VORBIS;
+        st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id   = AV_CODEC_ID_VORBIS;
 
         if (srate > 0) {
-            st->codec->sample_rate = srate;
+            st->codecpar->sample_rate = srate;
             avpriv_set_pts_info(st, 64, 1, srate);
         }
     } else if (os->buf[os->pstart] == 3) {
@@ -365,16 +389,23 @@ static int vorbis_header(AVFormatContext *s, int idx)
             }
         }
     } else {
-        int ret = fixup_vorbis_headers(s, priv, &st->codec->extradata);
+        int ret;
+
+        if (priv->vp)
+             return AVERROR_INVALIDDATA;
+
+        ret = fixup_vorbis_headers(s, priv, &st->codecpar->extradata);
         if (ret < 0) {
-            st->codec->extradata_size = 0;
+            st->codecpar->extradata_size = 0;
             return ret;
         }
-        st->codec->extradata_size = ret;
-        if ((ret = avpriv_vorbis_parse_extradata(st->codec, &priv->vp))) {
-            av_freep(&st->codec->extradata);
-            st->codec->extradata_size = 0;
-            return ret;
+        st->codecpar->extradata_size = ret;
+
+        priv->vp = av_vorbis_parse_init(st->codecpar->extradata, st->codecpar->extradata_size);
+        if (!priv->vp) {
+            av_freep(&st->codecpar->extradata);
+            st->codecpar->extradata_size = 0;
+            return AVERROR_UNKNOWN;
         }
     }
 
@@ -388,6 +419,9 @@ static int vorbis_packet(AVFormatContext *s, int idx)
     struct oggvorbis_private *priv = os->private;
     int duration, flags = 0;
 
+    if (!priv->vp)
+        return AVERROR_INVALIDDATA;
+
     /* first packet handling
      * here we parse the duration of each packet in the first page and compare
      * the total duration to the page granule to find the encoder delay and
@@ -397,10 +431,10 @@ static int vorbis_packet(AVFormatContext *s, int idx)
         uint8_t *last_pkt  = os->buf + os->pstart;
         uint8_t *next_pkt  = last_pkt;
 
-        avpriv_vorbis_parse_reset(&priv->vp);
+        av_vorbis_parse_reset(priv->vp);
         duration = 0;
         seg = os->segp;
-        d = avpriv_vorbis_parse_frame_flags(&priv->vp, last_pkt, 1, &flags);
+        d = av_vorbis_parse_frame_flags(priv->vp, last_pkt, 1, &flags);
         if (d < 0) {
             os->pflags |= AV_PKT_FLAG_CORRUPT;
             return 0;
@@ -412,7 +446,7 @@ static int vorbis_packet(AVFormatContext *s, int idx)
         last_pkt = next_pkt =  next_pkt + os->psize;
         for (; seg < os->nsegs; seg++) {
             if (os->segments[seg] < 255) {
-                int d = avpriv_vorbis_parse_frame_flags(&priv->vp, last_pkt, 1, &flags);
+                int d = av_vorbis_parse_frame_flags(priv->vp, last_pkt, 1, &flags);
                 if (d < 0) {
                     duration = os->granule;
                     break;
@@ -437,12 +471,12 @@ static int vorbis_packet(AVFormatContext *s, int idx)
                 s->streams[idx]->duration -= s->streams[idx]->start_time;
         }
         priv->final_pts          = AV_NOPTS_VALUE;
-        avpriv_vorbis_parse_reset(&priv->vp);
+        av_vorbis_parse_reset(priv->vp);
     }
 
     /* parse packet duration */
     if (os->psize > 0) {
-        duration = avpriv_vorbis_parse_frame_flags(&priv->vp, os->buf + os->pstart, 1, &flags);
+        duration = av_vorbis_parse_frame_flags(priv->vp, os->buf + os->pstart, 1, &flags);
         if (duration < 0) {
             os->pflags |= AV_PKT_FLAG_CORRUPT;
             return 0;
@@ -462,8 +496,12 @@ static int vorbis_packet(AVFormatContext *s, int idx)
             priv->final_pts      = os->lastpts;
             priv->final_duration = 0;
         }
-        if (os->segp == os->nsegs)
+        if (os->segp == os->nsegs) {
+            int64_t skip = priv->final_pts + priv->final_duration + os->pduration - os->granule;
+            if (skip > 0)
+                os->end_trimming = skip;
             os->pduration = os->granule - priv->final_pts - priv->final_duration;
+        }
         priv->final_duration += os->pduration;
     }
 

@@ -21,13 +21,13 @@
  * audio volume filter
  */
 
-#ifndef AVFILTER_AF_VOLUME_H
-#define AVFILTER_AF_VOLUME_H
+#ifndef AVFILTER_VOLUME_H
+#define AVFILTER_VOLUME_H
 
-#include "libavutil/common.h"
+#include <stdint.h>
 #include "libavutil/eval.h"
 #include "libavutil/float_dsp.h"
-#include "libavutil/opt.h"
+#include "libavutil/log.h"
 #include "libavutil/samplefmt.h"
 
 enum PrecisionType {
@@ -47,7 +47,9 @@ enum VolumeVarName {
     VAR_NB_CHANNELS,
     VAR_NB_CONSUMED_SAMPLES,
     VAR_NB_SAMPLES,
+#if FF_API_FRAME_PKT
     VAR_POS,
+#endif
     VAR_PTS,
     VAR_SAMPLE_RATE,
     VAR_STARTPTS,
@@ -67,14 +69,14 @@ enum ReplayGainType {
 
 typedef struct VolumeContext {
     const AVClass *class;
-    AVFloatDSPContext fdsp;
-    enum PrecisionType precision;
-    enum EvalMode eval_mode;
+    AVFloatDSPContext *fdsp;
+    int precision;
+    int eval_mode;
     const char *volume_expr;
     AVExpr *volume_pexpr;
     double var_values[VAR_VARS_NB];
 
-    enum ReplayGainType replaygain;
+    int replaygain;
     double replaygain_preamp;
     int    replaygain_noclip;
     double volume;
@@ -90,4 +92,4 @@ typedef struct VolumeContext {
 
 void ff_volume_init_x86(VolumeContext *vol);
 
-#endif /* AVFILTER_AF_VOLUME_H */
+#endif /* AVFILTER_VOLUME_H */

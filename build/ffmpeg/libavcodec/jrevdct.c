@@ -62,8 +62,13 @@
  * Independent JPEG Group's LLM idct.
  */
 
-#include "libavutil/common.h"
+#include <stddef.h>
+#include <stdint.h>
+
+#include "libavutil/intreadwrite.h"
+
 #include "dct.h"
+#include "idctdsp.h"
 
 #define EIGHT_BIT_SAMPLES
 
@@ -232,7 +237,7 @@ void ff_j_rev_dct(DCTBLOCK data)
      * row DCT calculations can be simplified this way.
      */
 
-    register int *idataptr = (int*)dataptr;
+    register uint8_t *idataptr = (uint8_t*)dataptr;
 
     /* WARNING: we do the same permutation as MMX idct to simplify the
        video core */
@@ -250,12 +255,12 @@ void ff_j_rev_dct(DCTBLOCK data)
       if (d0) {
           /* Compute a 32 bit value to assign. */
           int16_t dcval = (int16_t) (d0 * (1 << PASS1_BITS));
-          register int v = (dcval & 0xffff) | ((dcval * (1 << 16)) & 0xffff0000);
+          register unsigned v = (dcval & 0xffff) | ((uint32_t)dcval << 16);
 
-          idataptr[0] = v;
-          idataptr[1] = v;
-          idataptr[2] = v;
-          idataptr[3] = v;
+          AV_WN32A(&idataptr[ 0], v);
+          AV_WN32A(&idataptr[ 4], v);
+          AV_WN32A(&idataptr[ 8], v);
+          AV_WN32A(&idataptr[12], v);
       }
 
       dataptr += DCTSIZE;       /* advance pointer to next row */
@@ -972,7 +977,7 @@ void ff_j_rev_dct4(DCTBLOCK data)
      * row DCT calculations can be simplified this way.
      */
 
-    register int *idataptr = (int*)dataptr;
+    register uint8_t *idataptr = (uint8_t*)dataptr;
 
     d0 = dataptr[0];
     d2 = dataptr[1];
@@ -983,11 +988,11 @@ void ff_j_rev_dct4(DCTBLOCK data)
       /* AC terms all zero */
       if (d0) {
           /* Compute a 32 bit value to assign. */
-          int16_t dcval = (int16_t) (d0 << PASS1_BITS);
-          register int v = (dcval & 0xffff) | ((dcval << 16) & 0xffff0000);
+          int16_t dcval = (int16_t) (d0 * (1 << PASS1_BITS));
+          register unsigned v = (dcval & 0xffff) | ((uint32_t)dcval << 16);
 
-          idataptr[0] = v;
-          idataptr[1] = v;
+          AV_WN32A(&idataptr[0], v);
+          AV_WN32A(&idataptr[4], v);
       }
 
       dataptr += DCTSTRIDE;     /* advance pointer to next row */
@@ -1003,8 +1008,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp2 = z1 + MULTIPLY(-d6, FIX_1_847759065);
                     tmp3 = z1 + MULTIPLY(d2, FIX_0_765366865);
 
-                    tmp0 = (d0 + d4) << CONST_BITS;
-                    tmp1 = (d0 - d4) << CONST_BITS;
+                    tmp0 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp1 = (d0 - d4) * (1 << CONST_BITS);
 
                     tmp10 = tmp0 + tmp3;
                     tmp13 = tmp0 - tmp3;
@@ -1015,8 +1020,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp2 = MULTIPLY(-d6, FIX_1_306562965);
                     tmp3 = MULTIPLY(d6, FIX_0_541196100);
 
-                    tmp0 = (d0 + d4) << CONST_BITS;
-                    tmp1 = (d0 - d4) << CONST_BITS;
+                    tmp0 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp1 = (d0 - d4) * (1 << CONST_BITS);
 
                     tmp10 = tmp0 + tmp3;
                     tmp13 = tmp0 - tmp3;
@@ -1029,8 +1034,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp2 = MULTIPLY(d2, FIX_0_541196100);
                     tmp3 = MULTIPLY(d2, FIX_1_306562965);
 
-                    tmp0 = (d0 + d4) << CONST_BITS;
-                    tmp1 = (d0 - d4) << CONST_BITS;
+                    tmp0 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp1 = (d0 - d4) * (1 << CONST_BITS);
 
                     tmp10 = tmp0 + tmp3;
                     tmp13 = tmp0 - tmp3;
@@ -1038,8 +1043,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp12 = tmp1 - tmp2;
             } else {
                     /* d0 != 0, d2 == 0, d4 != 0, d6 == 0 */
-                    tmp10 = tmp13 = (d0 + d4) << CONST_BITS;
-                    tmp11 = tmp12 = (d0 - d4) << CONST_BITS;
+                    tmp10 = tmp13 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp11 = tmp12 = (d0 - d4) * (1 << CONST_BITS);
             }
       }
 
@@ -1081,8 +1086,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp2 = z1 + MULTIPLY(-d6, FIX_1_847759065);
                     tmp3 = z1 + MULTIPLY(d2, FIX_0_765366865);
 
-                    tmp0 = (d0 + d4) << CONST_BITS;
-                    tmp1 = (d0 - d4) << CONST_BITS;
+                    tmp0 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp1 = (d0 - d4) * (1 << CONST_BITS);
 
                     tmp10 = tmp0 + tmp3;
                     tmp13 = tmp0 - tmp3;
@@ -1093,8 +1098,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp2 = MULTIPLY(-d6, FIX_1_306562965);
                     tmp3 = MULTIPLY(d6, FIX_0_541196100);
 
-                    tmp0 = (d0 + d4) << CONST_BITS;
-                    tmp1 = (d0 - d4) << CONST_BITS;
+                    tmp0 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp1 = (d0 - d4) * (1 << CONST_BITS);
 
                     tmp10 = tmp0 + tmp3;
                     tmp13 = tmp0 - tmp3;
@@ -1107,8 +1112,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp2 = MULTIPLY(d2, FIX_0_541196100);
                     tmp3 = MULTIPLY(d2, FIX_1_306562965);
 
-                    tmp0 = (d0 + d4) << CONST_BITS;
-                    tmp1 = (d0 - d4) << CONST_BITS;
+                    tmp0 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp1 = (d0 - d4) * (1 << CONST_BITS);
 
                     tmp10 = tmp0 + tmp3;
                     tmp13 = tmp0 - tmp3;
@@ -1116,8 +1121,8 @@ void ff_j_rev_dct4(DCTBLOCK data)
                     tmp12 = tmp1 - tmp2;
             } else {
                     /* d0 != 0, d2 == 0, d4 != 0, d6 == 0 */
-                    tmp10 = tmp13 = (d0 + d4) << CONST_BITS;
-                    tmp11 = tmp12 = (d0 - d4) << CONST_BITS;
+                    tmp10 = tmp13 = (d0 + d4) * (1 << CONST_BITS);
+                    tmp11 = tmp12 = (d0 - d4) * (1 << CONST_BITS);
             }
     }
 
@@ -1153,3 +1158,15 @@ void ff_j_rev_dct1(DCTBLOCK data){
 
 #undef FIX
 #undef CONST_BITS
+
+void ff_jref_idct_put(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
+{
+    ff_j_rev_dct(block);
+    ff_put_pixels_clamped_c(block, dest, line_size);
+}
+
+void ff_jref_idct_add(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
+{
+    ff_j_rev_dct(block);
+    ff_add_pixels_clamped_c(block, dest, line_size);
+}

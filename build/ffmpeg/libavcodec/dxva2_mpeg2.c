@@ -20,9 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/log.h"
+
 #include "dxva2_internal.h"
+#include "hwaccel_internal.h"
 #include "mpegutils.h"
+#include "mpegvideodec.h"
 
 #define MAX_SLICES 1024
 struct dxva2_picture_context {
@@ -35,25 +40,25 @@ struct dxva2_picture_context {
     unsigned               bitstream_size;
 };
 
-static void fill_picture_parameters(AVCodecContext *avctx,
-                                    struct dxva_context *ctx,
-                                    const struct MpegEncContext *s,
+void ff_dxva2_mpeg2_fill_picture_parameters(AVCodecContext *avctx,
+                                    AVDXVAContext *ctx,
                                     DXVA_PictureParameters *pp)
 {
-    const Picture *current_picture = s->current_picture_ptr;
+    const struct MpegEncContext *s = avctx->priv_data;
+    const MPVPicture *current_picture = s->cur_pic.ptr;
     int is_field = s->picture_structure != PICT_FRAME;
 
     memset(pp, 0, sizeof(*pp));
-    pp->wDecodedPictureIndex         = ff_dxva2_get_surface_index(ctx, current_picture->f);
     pp->wDeblockedPictureIndex       = 0;
     if (s->pict_type != AV_PICTURE_TYPE_I)
-        pp->wForwardRefPictureIndex  = ff_dxva2_get_surface_index(ctx, s->last_picture.f);
+        pp->wForwardRefPictureIndex  = ff_dxva2_get_surface_index(avctx, ctx, s->last_pic.ptr->f, 0);
     else
         pp->wForwardRefPictureIndex  = 0xffff;
     if (s->pict_type == AV_PICTURE_TYPE_B)
-        pp->wBackwardRefPictureIndex = ff_dxva2_get_surface_index(ctx, s->next_picture.f);
+        pp->wBackwardRefPictureIndex = ff_dxva2_get_surface_index(avctx, ctx, s->next_pic.ptr->f, 0);
     else
         pp->wBackwardRefPictureIndex = 0xffff;
+    pp->wDecodedPictureIndex         = ff_dxva2_get_surface_index(avctx, ctx, current_picture->f, 1);
     pp->wPicWidthInMBminus1          = s->mb_width  - 1;
     pp->wPicHeightInMBminus1         = (s->mb_height >> is_field) - 1;
     pp->bMacroblockWidthMinus1       = 15;
@@ -101,11 +106,11 @@ static void fill_picture_parameters(AVCodecContext *avctx,
     pp->bBitstreamConcealmentMethod  = 0;
 }
 
-static void fill_quantization_matrices(AVCodecContext *avctx,
-                                       struct dxva_context *ctx,
-                                       const struct MpegEncContext *s,
+void ff_dxva2_mpeg2_fill_quantization_matrices(AVCodecContext *avctx,
+                                       AVDXVAContext *ctx,
                                        DXVA_QmatrixData *qm)
 {
+    const struct MpegEncContext *s = avctx->priv_data;
     int i;
     for (i = 0; i < 4; i++)
         qm->bNewQmatrix[i] = 1;
@@ -118,12 +123,12 @@ static void fill_quantization_matrices(AVCodecContext *avctx,
     }
 }
 
-static void fill_slice(AVCodecContext *avctx,
-                       const struct MpegEncContext *s,
+void ff_dxva2_mpeg2_fill_slice(AVCodecContext *avctx,
                        DXVA_SliceInfo *slice,
                        unsigned position,
                        const uint8_t *buffer, unsigned size)
 {
+    const struct MpegEncContext *s = avctx->priv_data;
     int is_field = s->picture_structure != PICT_FRAME;
     GetBitContext gb;
 
@@ -146,23 +151,45 @@ static void fill_slice(AVCodecContext *avctx,
     slice->wMBbitOffset        = 4 * 8 + get_bits_count(&gb);
 }
 static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
-                                             DXVA2_DecodeBufferDesc *bs,
-                                             DXVA2_DecodeBufferDesc *sc)
+                                             DECODER_BUFFER_DESC *bs,
+                                             DECODER_BUFFER_DESC *sc)
 {
     const struct MpegEncContext *s = avctx->priv_data;
-    struct dxva_context *ctx = avctx->hwaccel_context;
+    AVDXVAContext *ctx = DXVA_CONTEXT(avctx);
     struct dxva2_picture_context *ctx_pic =
-        s->current_picture_ptr->hwaccel_picture_private;
+        s->cur_pic.ptr->hwaccel_picture_private;
     const int is_field = s->picture_structure != PICT_FRAME;
     const unsigned mb_count = s->mb_width * (s->mb_height >> is_field);
+    void     *dxva_data_ptr = NULL;
     uint8_t  *dxva_data, *current, *end;
     unsigned dxva_size;
     unsigned i;
+    unsigned type;
 
-    if (FAILED(IDirectXVideoDecoder_GetBuffer(ctx->decoder,
-                                              DXVA2_BitStreamDateBufferType,
-                                              (void **)&dxva_data, &dxva_size)))
+#if CONFIG_D3D11VA
+    if (ff_dxva2_is_d3d11(avctx)) {
+        type = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+        if (FAILED(ID3D11VideoContext_GetDecoderBuffer(D3D11VA_CONTEXT(ctx)->video_context,
+                                                       D3D11VA_CONTEXT(ctx)->decoder,
+                                                       type,
+                                                       &dxva_size, &dxva_data_ptr)))
+            return -1;
+    }
+#endif
+#if CONFIG_DXVA2
+    if (avctx->pix_fmt == AV_PIX_FMT_DXVA2_VLD) {
+        type = DXVA2_BitStreamDateBufferType;
+        if (FAILED(IDirectXVideoDecoder_GetBuffer(DXVA2_CONTEXT(ctx)->decoder,
+                                                  type,
+                                                  &dxva_data_ptr, &dxva_size)))
+            return -1;
+    }
+#endif
+
+    if (!dxva_data_ptr)
         return -1;
+
+    dxva_data = dxva_data_ptr;
     current = dxva_data;
     end = dxva_data + dxva_size;
 
@@ -186,19 +213,44 @@ static int commit_bitstream_and_slice_buffer(AVCodecContext *avctx,
         memcpy(current, &ctx_pic->bitstream[position], size);
         current += size;
     }
-    if (FAILED(IDirectXVideoDecoder_ReleaseBuffer(ctx->decoder,
-                                                  DXVA2_BitStreamDateBufferType)))
-        return -1;
+#if CONFIG_D3D11VA
+    if (ff_dxva2_is_d3d11(avctx))
+        if (FAILED(ID3D11VideoContext_ReleaseDecoderBuffer(D3D11VA_CONTEXT(ctx)->video_context, D3D11VA_CONTEXT(ctx)->decoder, type)))
+            return -1;
+#endif
+#if CONFIG_DXVA2
+    if (avctx->pix_fmt == AV_PIX_FMT_DXVA2_VLD)
+        if (FAILED(IDirectXVideoDecoder_ReleaseBuffer(DXVA2_CONTEXT(ctx)->decoder, type)))
+            return -1;
+#endif
     if (i < ctx_pic->slice_count)
         return -1;
 
-    memset(bs, 0, sizeof(*bs));
-    bs->CompressedBufferType = DXVA2_BitStreamDateBufferType;
-    bs->DataSize             = current - dxva_data;
-    bs->NumMBsInBuffer       = mb_count;
+#if CONFIG_D3D11VA
+    if (ff_dxva2_is_d3d11(avctx)) {
+        D3D11_VIDEO_DECODER_BUFFER_DESC *dsc11 = bs;
+        memset(dsc11, 0, sizeof(*dsc11));
+        dsc11->BufferType           = type;
+        dsc11->DataSize             = current - dxva_data;
+        dsc11->NumMBsInBuffer       = mb_count;
+
+        type = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+    }
+#endif
+#if CONFIG_DXVA2
+    if (avctx->pix_fmt == AV_PIX_FMT_DXVA2_VLD) {
+        DXVA2_DecodeBufferDesc *dsc2 = bs;
+        memset(dsc2, 0, sizeof(*dsc2));
+        dsc2->CompressedBufferType = type;
+        dsc2->DataSize             = current - dxva_data;
+        dsc2->NumMBsInBuffer       = mb_count;
+
+        type = DXVA2_SliceControlBufferType;
+    }
+#endif
 
     return ff_dxva2_commit_buffer(avctx, ctx, sc,
-                                  DXVA2_SliceControlBufferType,
+                                  type,
                                   ctx_pic->slice,
                                   ctx_pic->slice_count * sizeof(*ctx_pic->slice),
                                   mb_count);
@@ -209,16 +261,16 @@ static int dxva2_mpeg2_start_frame(AVCodecContext *avctx,
                                    av_unused uint32_t size)
 {
     const struct MpegEncContext *s = avctx->priv_data;
-    struct dxva_context *ctx = avctx->hwaccel_context;
+    AVDXVAContext *ctx = DXVA_CONTEXT(avctx);
     struct dxva2_picture_context *ctx_pic =
-        s->current_picture_ptr->hwaccel_picture_private;
+        s->cur_pic.ptr->hwaccel_picture_private;
 
-    if (!ctx->decoder || !ctx->cfg || ctx->surface_count <= 0)
+    if (!DXVA_CONTEXT_VALID(avctx, ctx))
         return -1;
-    assert(ctx_pic);
+    av_assert0(ctx_pic);
 
-    fill_picture_parameters(avctx, ctx, s, &ctx_pic->pp);
-    fill_quantization_matrices(avctx, ctx, s, &ctx_pic->qm);
+    ff_dxva2_mpeg2_fill_picture_parameters(avctx, ctx, &ctx_pic->pp);
+    ff_dxva2_mpeg2_fill_quantization_matrices(avctx, ctx, &ctx_pic->qm);
 
     ctx_pic->slice_count    = 0;
     ctx_pic->bitstream_size = 0;
@@ -231,7 +283,7 @@ static int dxva2_mpeg2_decode_slice(AVCodecContext *avctx,
 {
     const struct MpegEncContext *s = avctx->priv_data;
     struct dxva2_picture_context *ctx_pic =
-        s->current_picture_ptr->hwaccel_picture_private;
+        s->cur_pic.ptr->hwaccel_picture_private;
     unsigned position;
 
     if (ctx_pic->slice_count >= MAX_SLICES) {
@@ -244,7 +296,7 @@ static int dxva2_mpeg2_decode_slice(AVCodecContext *avctx,
     ctx_pic->bitstream_size += size;
 
     position = buffer - ctx_pic->bitstream;
-    fill_slice(avctx, s, &ctx_pic->slice[ctx_pic->slice_count++], position,
+    ff_dxva2_mpeg2_fill_slice(avctx, &ctx_pic->slice[ctx_pic->slice_count++], position,
                buffer, size);
     return 0;
 }
@@ -253,12 +305,12 @@ static int dxva2_mpeg2_end_frame(AVCodecContext *avctx)
 {
     struct MpegEncContext *s = avctx->priv_data;
     struct dxva2_picture_context *ctx_pic =
-        s->current_picture_ptr->hwaccel_picture_private;
+        s->cur_pic.ptr->hwaccel_picture_private;
     int ret;
 
     if (ctx_pic->slice_count <= 0 || ctx_pic->bitstream_size <= 0)
         return -1;
-    ret = ff_dxva2_common_end_frame(avctx, s->current_picture_ptr->f,
+    ret = ff_dxva2_common_end_frame(avctx, s->cur_pic.ptr->f,
                                     &ctx_pic->pp, sizeof(ctx_pic->pp),
                                     &ctx_pic->qm, sizeof(ctx_pic->qm),
                                     commit_bitstream_and_slice_buffer);
@@ -267,13 +319,53 @@ static int dxva2_mpeg2_end_frame(AVCodecContext *avctx)
     return ret;
 }
 
-AVHWAccel ff_mpeg2_dxva2_hwaccel = {
-    .name           = "mpeg2_dxva2",
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MPEG2VIDEO,
-    .pix_fmt        = AV_PIX_FMT_DXVA2_VLD,
+#if CONFIG_MPEG2_DXVA2_HWACCEL
+const FFHWAccel ff_mpeg2_dxva2_hwaccel = {
+    .p.name         = "mpeg2_dxva2",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MPEG2VIDEO,
+    .p.pix_fmt      = AV_PIX_FMT_DXVA2_VLD,
+    .init           = ff_dxva2_decode_init,
+    .uninit         = ff_dxva2_decode_uninit,
     .start_frame    = dxva2_mpeg2_start_frame,
     .decode_slice   = dxva2_mpeg2_decode_slice,
     .end_frame      = dxva2_mpeg2_end_frame,
+    .frame_params   = ff_dxva2_common_frame_params,
     .frame_priv_data_size = sizeof(struct dxva2_picture_context),
+    .priv_data_size = sizeof(FFDXVASharedContext),
 };
+#endif
+
+#if CONFIG_MPEG2_D3D11VA_HWACCEL
+const FFHWAccel ff_mpeg2_d3d11va_hwaccel = {
+    .p.name         = "mpeg2_d3d11va",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MPEG2VIDEO,
+    .p.pix_fmt      = AV_PIX_FMT_D3D11VA_VLD,
+    .init           = ff_dxva2_decode_init,
+    .uninit         = ff_dxva2_decode_uninit,
+    .start_frame    = dxva2_mpeg2_start_frame,
+    .decode_slice   = dxva2_mpeg2_decode_slice,
+    .end_frame      = dxva2_mpeg2_end_frame,
+    .frame_params   = ff_dxva2_common_frame_params,
+    .frame_priv_data_size = sizeof(struct dxva2_picture_context),
+    .priv_data_size = sizeof(FFDXVASharedContext),
+};
+#endif
+
+#if CONFIG_MPEG2_D3D11VA2_HWACCEL
+const FFHWAccel ff_mpeg2_d3d11va2_hwaccel = {
+    .p.name         = "mpeg2_d3d11va2",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MPEG2VIDEO,
+    .p.pix_fmt      = AV_PIX_FMT_D3D11,
+    .init           = ff_dxva2_decode_init,
+    .uninit         = ff_dxva2_decode_uninit,
+    .start_frame    = dxva2_mpeg2_start_frame,
+    .decode_slice   = dxva2_mpeg2_decode_slice,
+    .end_frame      = dxva2_mpeg2_end_frame,
+    .frame_params   = ff_dxva2_common_frame_params,
+    .frame_priv_data_size = sizeof(struct dxva2_picture_context),
+    .priv_data_size = sizeof(FFDXVASharedContext),
+};
+#endif

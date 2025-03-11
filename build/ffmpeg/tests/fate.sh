@@ -1,4 +1,4 @@
-#! /bin/sh
+#!/bin/sh
 
 config=$1
 
@@ -19,6 +19,8 @@ test -n "$slot"    || die "slot not specified"
 test -n "$repo"    || die "repo not specified"
 test -d "$samples" || die "samples location not specified"
 
+: ${branch:=master}
+
 lock(){
     lock=$1/fate.lock
     (set -C; exec >$lock) 2>/dev/null || return
@@ -28,14 +30,14 @@ lock(){
 checkout(){
     case "$repo" in
         file:*|/*) src="${repo#file:}"      ;;
-        git:*)     git clone --quiet "$repo" "$src" ;;
+        git:*|https:*) git clone --quiet --branch "$branch" "$repo" "$src" ;;
     esac
 }
 
 update()(
     cd ${src} || return
     case "$repo" in
-        git:*) git fetch --force && git reset --hard FETCH_HEAD ;;
+        git:*|https:*) git fetch --quiet --force && git reset --quiet --hard "origin/$branch" ;;
     esac
 )
 
@@ -46,9 +48,10 @@ configure()(
         --samples="${samples}"                                          \
         --enable-gpl                                                    \
         --enable-memory-poisoning                                       \
-        --enable-avresample                                             \
+        ${ignore_tests:+--ignore-tests="$ignore_tests"}                 \
         ${arch:+--arch=$arch}                                           \
         ${cpu:+--cpu="$cpu"}                                            \
+        ${toolchain:+--toolchain="$toolchain"}                          \
         ${cross_prefix:+--cross-prefix="$cross_prefix"}                 \
         ${as:+--as="$as"}                                               \
         ${cc:+--cc="$cc"}                                               \
@@ -72,7 +75,19 @@ compile()(
 fate()(
     test "$build_only" = "yes" && return
     cd ${build} || return
-    ${make} ${makeopts} -k fate
+    if [ -n "${fate_environments}" ]; then
+        ret=0
+        for e in ${fate_environments}; do
+            eval "curenv=\${${e}_env}"
+            echo Testing environment ${e}: ${curenv}
+            ${make} ${makeopts_fate-${makeopts}} -k ${fate_targets} FATE_SUFFIX=_${e} ${curenv}
+            cur_ret=$?
+            test $cur_ret != 0 && ret=$cur_ret
+        done
+        return $ret
+    else
+        ${make} ${makeopts_fate-${makeopts}} -k ${fate_targets}
+    fi
 )
 
 clean(){
@@ -81,8 +96,9 @@ clean(){
 
 report(){
     date=$(date -u +%Y%m%d%H%M%S)
-    echo "fate:0:${date}:${slot}:${version}:$1:$2:${comment}" >report
-    cat ${build}/config.fate ${build}/tests/data/fate/*.rep >>report
+    echo "fate:1:${date}:${slot}:${version}:$1:$2:${branch}:${comment}" >report
+    cat ${build}/ffbuild/config.fate >>report
+    cat ${build}/tests/data/fate/*.rep >>report 2>/dev/null || for i in ${build}/tests/data/fate/*.rep ; do cat "$i" >>report 2>/dev/null; done
     test -n "$fate_recv" && $tar report *.log | gzip | $fate_recv
 }
 
@@ -99,12 +115,13 @@ cd ${workdir}       || die "cd ${workdir} failed"
 src=${workdir}/src
 : ${build:=${workdir}/build}
 : ${inst:=${workdir}/install}
+: ${fate_targets:=fate}
 
 test -d "$src" && update || checkout || die "Error fetching source"
 
 cd ${workdir}
 
-version=$(${src}/version.sh ${src})
+version=$(${src}/ffbuild/version.sh ${src})
 test "$version" = "$(cat version-$slot 2>/dev/null)" && exit 0
 echo ${version} >version-$slot
 

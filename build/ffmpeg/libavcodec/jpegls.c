@@ -25,6 +25,10 @@
  * JPEG-LS common code.
  */
 
+#include <stddef.h>
+#include "libavutil/internal.h"
+#include "libavutil/intmath.h"
+#include "libavutil/log.h"
 #include "jpegls.h"
 
 void ff_jpegls_init_state(JLSState *state)
@@ -96,5 +100,5 @@ void ff_jpegls_reset_coding_parameters(JLSState *s, int reset_all)
 
     if (s->reset == 0 || reset_all)
         s->reset = 64;
-    av_dlog(NULL, "[JPEG-LS RESET] T=%i,%i,%i\n", s->T1, s->T2, s->T3);
+    ff_dlog(NULL, "[JPEG-LS RESET] T=%i,%i,%i\n", s->T1, s->T2, s->T3);
 }

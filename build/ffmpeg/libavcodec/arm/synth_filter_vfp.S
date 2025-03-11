@@ -124,15 +124,18 @@ function ff_synth_filter_float_vfp, export=1
         push    {r3-r7,lr}
         vpush   {s16-s31}
         ldr     lr, [P_SB_OFF]
-        add     a2, ORIG_P_SB, lr, LSL #2 @ calculate synth_buf to pass to imdct_half
+        add     a2, ORIG_P_SB, lr, lsl #2 @ calculate synth_buf to pass to imdct_half
         mov     P_SB, a2                  @ and keep a copy for ourselves
         bic     J_WRAP, lr, #63           @ mangled to make testing for wrap easier in inner loop
         sub     lr, lr, #32
         and     lr, lr, #512-32
         str     lr, [P_SB_OFF]            @ rotate offset, modulo buffer size, ready for next call
         ldr     a3, [sp, #(16+6+2)*4]     @ fetch in from stack, to pass to imdct_half
+        mov     a4, #4                    @ sizeof(float)
+VFP     ldr     r12, [sp, #(16+6+3)*4]    @ fetch imdct_fn from stack
+NOVFP   ldr     r12, [sp, #(16+6+4)*4]    @ fetch imdct_fn from stack
 VFP     vmov    s16, SCALE                @ imdct_half is free to corrupt s0, but it contains one of our arguments in hardfp case
-        bl      X(ff_imdct_half_vfp)
+        blx     r12
 VFP     vmov    SCALE, s16
 
         fmrx    OLDFPSCR, FPSCR
